@@ -235,6 +235,34 @@ wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
                               int32 local_index, char buf[], int32 *size);
 
 bool
+wasm_debug_instance_set_local(WASMDebugInstance *instance, int32 frame_index,
+                              int32 local_index, const char *buf, int32 size);
+
+/* IW REPL stdout capture (subplan #4 Part B2).
+ *
+ * When the debug-engine is about to invoke an inferior call
+ * (qWasmCall), it calls `wasm_debug_stdout_capture_begin` to install
+ * a one-shot capture buffer. The wasi `fd_write` adapter checks
+ * `wasm_debug_stdout_try_capture` on every write to fd 1/2; if a
+ * capture is active, the bytes land in the buffer instead of the
+ * host's stdout/stderr. After the inferior call returns,
+ * `wasm_debug_stdout_capture_end` returns the captured bytes and
+ * resets the active flag.
+ *
+ * Globally one-at-a-time — the DAP adapter serialises evaluate
+ * requests via AsyncLock so only one capture is ever in flight. The
+ * buffer is statically sized; overflow truncates with a marker.
+ */
+void
+wasm_debug_stdout_capture_begin(void);
+
+bool
+wasm_debug_stdout_try_capture(const char *buf, uint32 len);
+
+void
+wasm_debug_stdout_capture_end(const char **out_buf, uint32 *out_size);
+
+bool
 wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
                                int32 global_index, char buf[], int32 *size);
 

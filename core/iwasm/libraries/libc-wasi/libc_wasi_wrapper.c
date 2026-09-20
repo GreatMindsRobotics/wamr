@@ -682,6 +682,39 @@ wasi_fd_write(wasm_exec_env_t exec_env, wasi_fd_t fd,
         ciovec->buf_len = iovec_app->buf_len;
     }
 
+#if WASM_ENABLE_DEBUG_INTERP != 0
+    /* IW REPL stdout capture (subplan #4 Part B2). When the debug
+     * engine has installed a capture (i.e. we're inside a qWasmCall
+     * inferior call), divert writes to fd 1 / fd 2 into the capture
+     * buffer so the host can ship them back in the qWasmCall reply.
+     * Writes to other fds and writes outside a capture window go
+     * through the normal wasmtime_ssp_fd_write path. */
+    if (fd == 1 || fd == 2) {
+        extern bool wasm_debug_stdout_try_capture(const char *, uint32);
+        bool any_captured = false;
+        size_t cap_total = 0;
+        ciovec = ciovec_begin;
+        for (i = 0; i < iovs_len; i++, ciovec++) {
+            if (wasm_debug_stdout_try_capture(ciovec->buf,
+                                              (uint32)ciovec->buf_len))
+            {
+                any_captured = true;
+                cap_total += ciovec->buf_len;
+            }
+            else {
+                any_captured = false;
+                break;
+            }
+        }
+        if (any_captured) {
+            *nwritten_app = (uint32)cap_total;
+            err = 0;
+            goto fail;  /* releases ciovec_begin and returns 0 */
+        }
+        /* No capture active: fall through to the host fd. */
+    }
+#endif
+
     err = wasmtime_ssp_fd_write(exec_env, curfds, fd, ciovec_begin, iovs_len,
                                 &nwritten);
     if (err)

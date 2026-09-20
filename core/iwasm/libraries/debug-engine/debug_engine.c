@@ -1308,6 +1308,131 @@ wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
     return true;
 }
 
+/* IW REPL stdout capture (subplan #4 Part B2). See debug_engine.h. */
+#define DEBUG_STDOUT_CAPTURE_CAP 16384
+static korp_mutex stdout_capture_lock;
+static bool stdout_capture_lock_init = false;
+static bool stdout_capture_active = false;
+static char stdout_capture_buf[DEBUG_STDOUT_CAPTURE_CAP];
+static uint32 stdout_capture_size = 0;
+
+static void
+ensure_stdout_lock_init(void)
+{
+    /* Lazy init — debug_engine_init might not have been called yet
+     * for some embed paths. The race is benign because we always
+     * call this before any read/write of the active flag. */
+    if (!stdout_capture_lock_init) {
+        os_mutex_init(&stdout_capture_lock);
+        stdout_capture_lock_init = true;
+    }
+}
+
+void
+wasm_debug_stdout_capture_begin(void)
+{
+    ensure_stdout_lock_init();
+    os_mutex_lock(&stdout_capture_lock);
+    stdout_capture_size = 0;
+    stdout_capture_active = true;
+    os_mutex_unlock(&stdout_capture_lock);
+}
+
+bool
+wasm_debug_stdout_try_capture(const char *buf, uint32 len)
+{
+    bool captured;
+    ensure_stdout_lock_init();
+    os_mutex_lock(&stdout_capture_lock);
+    if (!stdout_capture_active) {
+        os_mutex_unlock(&stdout_capture_lock);
+        return false;
+    }
+    if (stdout_capture_size < DEBUG_STDOUT_CAPTURE_CAP) {
+        uint32 room = DEBUG_STDOUT_CAPTURE_CAP - stdout_capture_size;
+        uint32 copy = len < room ? len : room;
+        memcpy(stdout_capture_buf + stdout_capture_size, buf, copy);
+        stdout_capture_size += copy;
+    }
+    captured = true;
+    os_mutex_unlock(&stdout_capture_lock);
+    return captured;
+}
+
+void
+wasm_debug_stdout_capture_end(const char **out_buf, uint32 *out_size)
+{
+    ensure_stdout_lock_init();
+    os_mutex_lock(&stdout_capture_lock);
+    stdout_capture_active = false;
+    *out_buf = stdout_capture_buf;
+    *out_size = stdout_capture_size;
+    os_mutex_unlock(&stdout_capture_lock);
+}
+
+/* Symmetric counterpart to wasm_debug_instance_get_local (subplan #4
+ * Part H). Writes <c>size</c> bytes from <c>buf</c> into the wasm
+ * local at (frame_index, local_index) in the paused thread. The IW
+ * REPL uses this to propagate scalar mutations made by a fragment
+ * back into the paused frame so the user sees `x = 5` reflected
+ * when they hit Continue. Returns false on missing frame, out-of-
+ * range local index, or type/size mismatch. */
+bool
+wasm_debug_instance_set_local(WASMDebugInstance *instance, int32 frame_index,
+                              int32 local_index, const char *buf, int32 size)
+{
+    WASMExecEnv *exec_env;
+    struct WASMInterpFrame *frame;
+    WASMFunctionInstance *cur_func;
+    uint8 local_type = 0xFF;
+    uint32 local_offset;
+    int32 param_count;
+    int32 fi = 0;
+
+    if (!instance)
+        return false;
+
+    exec_env = wasm_debug_instance_get_current_env(instance);
+    if (!exec_env)
+        return false;
+
+    frame = exec_env->cur_frame;
+    while (frame && fi++ != frame_index) {
+        frame = frame->prev_frame;
+    }
+
+    if (!frame)
+        return false;
+    cur_func = frame->function;
+    if (!cur_func)
+        return false;
+
+    param_count = cur_func->param_count;
+    if (local_index >= param_count + cur_func->local_count)
+        return false;
+
+    local_offset = cur_func->local_offsets[local_index];
+    if (local_index < param_count)
+        local_type = cur_func->param_types[local_index];
+    else if (local_index < cur_func->local_count + param_count)
+        local_type = cur_func->local_types[local_index - param_count];
+
+    switch (local_type) {
+        case VALUE_TYPE_I32:
+        case VALUE_TYPE_F32:
+            if (size != 4) return false;
+            bh_memcpy_s((char *)(frame->lp + local_offset), 4, buf, 4);
+            return true;
+        case VALUE_TYPE_I64:
+        case VALUE_TYPE_F64:
+            if (size != 8) return false;
+            bh_memcpy_s((char *)(frame->lp + local_offset), 8, buf, 8);
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool
 wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
                                int32 global_index, char buf[], int32 *size)
