@@ -7,9 +7,14 @@ if (MSVC)
   add_compile_options(/W4)
 else ()
   # refer to https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html
+  # Language guards on every flag — MASM (ml64) rejects GCC-style -W*
+  # arguments (invokeNative_em64.asm can't build without them).
   add_compile_options(
-    -Wall -Wextra -Wformat -Wformat-security
-     $<$<COMPILE_LANGUAGE:C>:-Wshadow>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wformat>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wformat-security>
+    $<$<COMPILE_LANGUAGE:C>:-Wshadow>
   )
   # -pedantic causes warnings like "ISO C forbids initialization between function pointer and ‘void *’" which
   #   is widely used in the codebase.
@@ -35,12 +40,12 @@ else ()
 
   # options benefit embedded system.
   add_compile_options (
-    -Wdouble-promotion
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wdouble-promotion>
   )
 
   # waivers
   add_compile_options (
-    -Wno-unused
-    -Wno-unused-parameter
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
   )
 endif ()
