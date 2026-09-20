@@ -108,10 +108,32 @@ set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
 
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 
+# WAMR's wasm_export.h defines WASM_RUNTIME_API_EXTERN as
+# __declspec(dllimport) when _MSC_BUILD is defined (MSVC or clang.exe
+# in Windows mode — plain LLVM Windows clang sets _MSC_BUILD=1 to
+# mimic MSVC). But this platform build produces a STATIC library
+# (libiwasm.lib) and links iwasm.exe against it — no DLL involved.
+# lld-link rejects dllimport-declared symbols that resolve to static
+# defs ("undefined symbol: __declspec(dllimport) wasm_runtime_*").
+# Override the macro to empty; consistent with the header's else-branch
+# for non-MSVC static builds. Applied globally so vmlib and iwasm
+# agree on symbol linkage attributes.
+add_compile_definitions (WASM_RUNTIME_API_EXTERN= WASM_API_EXTERN=)
+
 #set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DWIN32_LEAN_AND_MEAN")
 if (NOT MINGW)
-  set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SAFESEH:NO")
-  set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /SAFESEH:NO")
+  # /SAFESEH:NO is a link.exe / lld-link option. When cl.exe drives the
+  # link it passes through unchanged. When plain clang.exe drives the
+  # link (via -fuse-ld=lld-link) it needs -Xlinker to pass raw
+  # options through — otherwise clang treats /SAFESEH:NO as a source
+  # file and fails with "no such file or directory".
+  if (CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Xlinker /SAFESEH:NO")
+    set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Xlinker /SAFESEH:NO")
+  else ()
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SAFESEH:NO")
+    set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /SAFESEH:NO")
+  endif ()
 endif ()
 
 # The following flags are to enhance security, but it may impact performance,
@@ -124,7 +146,64 @@ endif ()
 
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
-add_executable (iwasm main.c ${PLATFORM_SHARED_SOURCE} ${UNCOMMON_SHARED_SOURCE} ${UTILS_SHARED_SOURCE})
+# Option 2 (runtime-as-imports): mirror darwin/CMakeLists.txt §128-149.
+# The 6 pure Clay runtime .c files (clay_panic, clay_format, clay_check,
+# clay_intrinsics, clay_string, clay_f16) compile into iwasm as native
+# C and provide the function bodies that user wasms now import under
+# module "clay_rt".  The wrapper layer is clay_rt_natives.c, auto-
+# generated from clay_runtime.h by gen_clay_rt_natives.py.  Its output
+# is host-agnostic, so there is a single copy at
+# Clay/runtime/natives/clay_rt_natives.c shared by every embedder
+# (host iwasm, Brickyard controller, Nucleo firmware).  Without these sources,
+# iwasm can't instantiate any wasm built with -DCLAY_RUNTIME_AS_IMPORTS,
+# which is what Sculptor's clay-host build mode produces.
+set (CLAY_RUNTIME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime)
+set (CLAY_NATIVES_DIR ${CLAY_RUNTIME_DIR}/natives)
+set (CLAY_RUNTIME_SOURCES
+  ${CLAY_RUNTIME_DIR}/clay_panic.c
+  ${CLAY_RUNTIME_DIR}/clay_format.c
+  ${CLAY_RUNTIME_DIR}/clay_check.c
+  ${CLAY_RUNTIME_DIR}/clay_intrinsics.c
+  ${CLAY_RUNTIME_DIR}/clay_string.c
+  ${CLAY_RUNTIME_DIR}/clay_f16.c
+)
+
+add_executable (iwasm main.c
+                ${CLAY_NATIVES_DIR}/clay_mock_natives.c
+                ${CLAY_NATIVES_DIR}/clay_rt_natives.c
+                ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
+target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
+target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
+# vmlib's WAMR_RUNTIME_LIB_SOURCE (build-scripts/runtime_lib.cmake §209)
+# already carries PLATFORM_SHARED_SOURCE and UTILS_SHARED_SOURCE, so we
+# do NOT relist those — repeating them would feed lld-link two copies
+# of every symbol they define.  UNCOMMON_SHARED_SOURCE (bh_read_file_*)
+# is the one set that vmlib does not include and main.c references, so
+# it has to live in the iwasm exe.  cl.exe's linker silently de-duped
+# the prior over-inclusive list, which is why the divergence was
+# invisible before the ClangCL switch.
+
+# When using clang-cl, the link step is lld-link which doesn't auto-
+# pull clang's compiler-rt builtins (whereas a plain clang link line
+# does).  Clay's f16 helpers (clay_render_float16 et al.) need
+# `__truncsfhf2` / `__extendhfsf2` from clang_rt.builtins to convert
+# between float and _Float16.  Discover the lib's location relative
+# to the compiler at configure time so we don't pin a specific LLVM
+# version.
+if (CMAKE_C_COMPILER_ID STREQUAL "Clang" AND WIN32)
+    get_filename_component (CLANG_BIN_DIR ${CMAKE_C_COMPILER} DIRECTORY)
+    get_filename_component (CLANG_ROOT ${CLANG_BIN_DIR} DIRECTORY)
+    file (GLOB CLANG_RT_BUILTINS
+          "${CLANG_ROOT}/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+    if (CLANG_RT_BUILTINS)
+        list (GET CLANG_RT_BUILTINS 0 CLANG_RT_BUILTINS_LIB)
+        message (STATUS "Linking clang_rt builtins: ${CLANG_RT_BUILTINS_LIB}")
+        target_link_libraries (iwasm "${CLANG_RT_BUILTINS_LIB}")
+    else ()
+        message (WARNING "clang_rt.builtins-x86_64.lib not found under ${CLANG_ROOT}; "
+                         "f16 helpers (__truncsfhf2 / __extendhfsf2) will fail to link")
+    endif ()
+endif ()
 
 set_version_info (iwasm)
 

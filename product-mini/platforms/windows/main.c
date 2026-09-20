@@ -16,6 +16,44 @@
 
 #include "../common/wasm_proposal.c"
 
+#ifdef CLAY_MOCK_NATIVES
+/* Clay panic hook (Option 2 — see clay_panic.c).  Mirrors the
+ * darwin/linux logic in posix/main.c §30-75.  When the Clay runtime
+ * detects an unrecoverable trap (E_BOUNDS / E_DIV / E_SHIFT /
+ * E_INTRINSIC) it writes a diagnostic to stderr and calls this hook.
+ * We route through WAMR's exception machinery so the wasm aborts
+ * cleanly without exit()ing iwasm — keeping the DAP stdio channel
+ * intact so Sculptor can surface the CLAY-RT-* diagnostic.
+ *
+ * Reaches for the current exec env via the global stash that every
+ * clay_rt wrapper writes on entry (g_clay_native_env, defined in
+ * clay_rt_natives.c).  Sets the exception on the module instance;
+ * the runtime function chain unwinds normally; WAMR traps on return. */
+#include <stdio.h>
+extern wasm_exec_env_t g_clay_native_env;
+void
+sculptor_clay_panic_hook(const char *code, const char *file, int line,
+                         const char *msg)
+{
+    char buf[256];
+    if (file == NULL)
+        file = "";
+    if (msg != NULL && msg[0] != '\0') {
+        snprintf(buf, sizeof(buf), "%s at %s:%d: %s", code, file, line, msg);
+    }
+    else {
+        snprintf(buf, sizeof(buf), "%s at %s:%d", code, file, line);
+    }
+    wasm_exec_env_t env = g_clay_native_env;
+    if (env != NULL) {
+        wasm_module_inst_t inst = wasm_runtime_get_module_inst(env);
+        if (inst != NULL) {
+            wasm_runtime_set_exception(inst, buf);
+        }
+    }
+}
+#endif
+
 static int app_argc;
 static char **app_argv;
 
@@ -555,6 +593,39 @@ main(int argc, char *argv[])
         printf("Init runtime environment failed.\n");
         return -1;
     }
+
+#ifdef CLAY_MOCK_NATIVES
+    /* Install the Clay panic hook + register the auto-generated Clay
+     * native tables.  Mirrors posix/main.c §948-995.  Without these,
+     * user wasms built with -DCLAY_RUNTIME_AS_IMPORTS (Sculptor's
+     * clay-host mode) can't instantiate — their `import "clay_rt"
+     * "clay_mul_i32"` and similar entries stay unlinked and trap at
+     * the first call.  See vendor/wamr/product-mini/platforms/windows/
+     * CMakeLists.txt and clay_rt_natives.c for the data side. */
+    {
+        extern void (*clay_panic_hook)(const char *, const char *, int,
+                                       const char *);
+        clay_panic_hook = sculptor_clay_panic_hook;
+    }
+    {
+        extern uint32_t clay_mock_natives_count(void);
+        extern NativeSymbol *clay_mock_natives(void);
+        extern uint32_t clay_rt_natives_count(void);
+        extern NativeSymbol *clay_rt_natives(void);
+        if (!wasm_runtime_register_natives("clay", clay_mock_natives(),
+                                           clay_mock_natives_count())) {
+            printf("Failed to register clay-mock natives.\n");
+            wasm_runtime_destroy();
+            return -1;
+        }
+        if (!wasm_runtime_register_natives("clay_rt", clay_rt_natives(),
+                                           clay_rt_natives_count())) {
+            printf("Failed to register clay_rt natives.\n");
+            wasm_runtime_destroy();
+            return -1;
+        }
+    }
+#endif
 
 #if WASM_ENABLE_LOG != 0
     bh_log_set_verbose_level(log_verbose_level);
