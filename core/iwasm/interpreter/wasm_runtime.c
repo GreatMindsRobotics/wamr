@@ -2800,6 +2800,18 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
             /* Ignore setting memory init data if the memory has been
                initialized */
             continue;
+        /* Sculptor IW REPL: when the qWasmLoadSide handler is loading a
+         * side module, the side's linear memory is a tiny
+         * placeholder that we're about to swap out (Part I in
+         * core/iwasm/libraries/debug-engine/handler.c). Copying data
+         * segments into that placeholder would overrun the 8-byte
+         * buffer. Handler.c re-copies the segments into main's memory
+         * after the swap (task #80) so semantics are preserved. */
+        {
+            extern bool g_clay_skip_side_linear_memory;
+            if (g_clay_skip_side_linear_memory)
+                continue;
+        }
 
         /* has check it in loader */
         memory = module_inst->memories[data_seg->memory_index];

@@ -2056,6 +2056,21 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
     memory_inst->memory_data = NULL;
 }
 
+/* Sculptor IW REPL: when set (by the qWasmLoadSide handler in
+ * core/iwasm/libraries/debug-engine/handler.c around its wasm_runtime_instantiate
+ * call), skip the real linear-memory allocation and hand back a tiny
+ * placeholder buffer instead. The Part I swap immediately replaces
+ * memories[0] with main's memory, so the side module's own linear
+ * memory is dead weight — and on an embedded target there is no room
+ * for it after main wasm + parsed module + debug-engine state. The
+ * placeholder satisfies wasm_deallocate_linear_memory's
+ * bh_assert(memory_data) without consuming a wasm page.
+ *
+ * Also paired with a check in wasm_runtime.c's data segment init loop
+ * to skip the per-segment copy into this fake memory (the handler
+ * re-copies into main's memory after the swap, task #80). */
+bool g_clay_skip_side_linear_memory = false;
+
 int
 wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
                             bool is_memory64, uint64 num_bytes_per_page,
@@ -2066,6 +2081,21 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
 
     bh_assert(data);
     bh_assert(memory_data_size);
+
+    if (g_clay_skip_side_linear_memory) {
+        /* 8-byte placeholder: large enough for the 8-byte alignment
+         * assert at the end of this function, small enough not to
+         * compete with the real 64 KiB page for heap.
+         * The next BH_FREE in wasm_munmap_linear_memory uses just
+         * the pointer, not the size — so freeing 8 bytes through a
+         * "64 KB-sized" frame works correctly. */
+        *data = wasm_runtime_malloc(8);
+        if (!*data) {
+            return BHT_ERROR;
+        }
+        *memory_data_size = 0;
+        return BHT_OK;
+    }
 
 #ifndef OS_ENABLE_HW_BOUND_CHECK
 #if WASM_ENABLE_SHARED_MEMORY != 0
