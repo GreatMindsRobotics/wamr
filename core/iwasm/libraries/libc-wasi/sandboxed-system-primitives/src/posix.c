@@ -2215,9 +2215,13 @@ wasmtime_ssp_poll_oneoff(wasm_exec_env_t exec_env, struct fd_table *curfds,
                                          __WASI_RIGHT_POLL_FD_READWRITE, 0);
                 if (error == 0) {
 
-// Temporary workaround (see PR#4377)
+// Temporary workaround (see PR#4377). On Zephyr,
+// os_file_handle is `struct zephyr_handle *` and
+// os_poll_file_handle is `struct zsock_pollfd` whose
+// .fd is an int — so we have to dereference the
+// handle here to get the underlying integer fd.
 #ifdef BH_PLATFORM_ZEPHYR
-                    os_file_handle tfd = fos[i]->file_handle->fd;
+                    int tfd = fos[i]->file_handle->fd;
 #else
                     os_file_handle tfd = fos[i]->file_handle;
 #endif
