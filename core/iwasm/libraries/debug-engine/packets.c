@@ -6,13 +6,25 @@
 #include "bh_platform.h"
 #include "packets.h"
 #include "gdbserver.h"
+#include "gdb_transport.h"
 
 void
 write_data_raw(WASMGDBServer *gdbserver, const uint8 *data, ssize_t len)
 {
     ssize_t nwritten;
 
-    nwritten = os_socket_send(gdbserver->socket_fd, data, len);
+    /* Route through the custom transport (USB-CDC on device) when one is
+     * registered. Without this the debug-engine writes back to a
+     * non-existent socket_fd and either errors or silently drops the
+     * reply — F5 from VSCode hangs because the wasm interpreter is
+     * paused waiting on a stop-reply that never reaches the client. */
+    const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+    if (t != NULL) {
+        nwritten = t->send(t->ctx, data, len);
+    }
+    else {
+        nwritten = os_socket_send(gdbserver->socket_fd, data, len);
+    }
     if (nwritten < 0) {
         LOG_ERROR("Write error\n");
         exit(-2);

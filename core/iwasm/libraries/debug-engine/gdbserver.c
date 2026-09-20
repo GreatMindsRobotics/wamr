@@ -5,6 +5,7 @@
 
 #include "bh_platform.h"
 #include "gdbserver.h"
+#include "gdb_transport.h"
 #include "handler.h"
 #include "packets.h"
 #include "utils.h"
@@ -60,6 +61,17 @@ wasm_create_gdbserver(const char *host, int *port)
 
     memset(server->receive_ctx, 0, sizeof(rsp_recv_context_t));
 
+    /* If a custom transport is registered (e.g., the USB-CDC transport
+     * the firmware installs at boot — see wamr_debug_usb.c),
+     * skip TCP socket setup entirely. The transport handles all the
+     * recv/send for this server through gdb_transport.c. Without this
+     * bypass, gdbserver init fails on bare-metal targets with
+     * "socket bind failed" because there's no networking stack. */
+    if (wasm_gdbserver_get_transport() != NULL) {
+        server->listen_fd = (bh_socket_t)-1;
+        return server;
+    }
+
     if (0 != os_socket_create(&listen_fd, true, true)) {
         LOG_ERROR("wasm gdb server error: create socket failed");
         goto fail;
@@ -92,6 +104,14 @@ wasm_gdbserver_listen(WASMGDBServer *server)
 {
     int32 ret;
 
+    /* No socket to listen on when a custom transport is registered;
+     * listen/accept are conceptual no-ops for UART (the host opens
+     * the tty whenever it wants — accept happens implicitly the
+     * first time recv sees data). */
+    if (wasm_gdbserver_get_transport() != NULL) {
+        return true;
+    }
+
     ret = os_socket_listen(server->listen_fd, 1);
     if (ret != 0) {
         LOG_ERROR("wasm gdb server error: socket listen failed");
@@ -112,6 +132,21 @@ wasm_gdbserver_accept(WASMGDBServer *server)
 {
 
     bh_socket_t sockt_fd = (bh_socket_t)-1;
+
+    /* Custom transport: delegate. The UART transport's `accept`
+     * implementation typically returns immediately (the port is
+     * always "open"); a TCP-over-USB-CDC transport would block on
+     * the first incoming connection. */
+    const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+    if (t != NULL) {
+        if (t->accept && !t->accept(t->ctx)) {
+            LOG_ERROR("wasm gdb server error: transport accept failed");
+            return false;
+        }
+        server->socket_fd = (bh_socket_t)-1;
+        server->noack = false;
+        return true;
+    }
 
     LOG_VERBOSE("waiting for gdb client to connect...");
 
@@ -281,6 +316,25 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
     int32 n;
     char buf[1024];
 
+    /* When a custom transport is registered, route through it.
+     * UART transports don't have a settimeout()-style knob; the
+     * 1000 ms wait is part of the recv() contract instead. */
+    const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+    if (t != NULL) {
+        n = (int32)t->recv(t->ctx, buf, sizeof(buf), 1000);
+        if (n == 0) {
+            /* 0 means peer EOF — UART doesn't have that, but
+             * fall through to the "no bytes" branch below. */
+            return true;
+        }
+        if (n < 0) {
+            /* Timeout / no bytes ready. */
+            return true;
+        }
+        /* Fall through with `n > 0` bytes in `buf`. */
+        goto rx_done;
+    }
+
     if (os_socket_settimeout(server->socket_fd, 1000) != 0) {
         LOG_ERROR("Set socket recv timeout failed");
         return false;
@@ -309,6 +363,8 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
         }
     }
     else {
+rx_done:
+    {
         int32 i, ret;
 
         for (i = 0; i < n; i++) {
@@ -324,6 +380,7 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
                 handle_interrupt(server);
             }
         }
+    }
     }
 
     return true;
