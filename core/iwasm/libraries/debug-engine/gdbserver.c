@@ -170,6 +170,12 @@ fail:
 void
 wasm_gdbserver_detach(WASMGDBServer *server)
 {
+    /* A custom transport stores (bh_socket_t)-1 in socket_fd. Where
+     * bh_socket_t is a pointer (Zephyr), that passes the > 0 test below
+     * and the shutdown dereferences 0xffffffff. There is no socket here. */
+    if (wasm_gdbserver_get_transport() != NULL) {
+        return;
+    }
     if (server->socket_fd > 0) {
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
@@ -181,6 +187,10 @@ wasm_close_gdbserver(WASMGDBServer *server)
 {
     if (server->receive_ctx) {
         wasm_runtime_free(server->receive_ctx);
+    }
+    /* No sockets with a custom transport; see wasm_gdbserver_detach. */
+    if (wasm_gdbserver_get_transport() != NULL) {
+        return;
     }
     if (server->socket_fd > 0) {
         os_socket_shutdown(server->socket_fd);
