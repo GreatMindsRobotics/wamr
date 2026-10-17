@@ -147,7 +147,11 @@ control_thread_routine(void *arg)
     while (true) {
         /* wait lldb client to connect */
         if (!wasm_gdbserver_accept(control_thread->server)) {
-            LOG_ERROR("Failed while accepting debugger connection\n");
+            /* A stopping control thread's accept fails by design:
+             * wasm_debug_control_thread_destroy closed the socket. */
+            if (!is_thread_stopped(control_thread)) {
+                LOG_ERROR("Failed while accepting debugger connection\n");
+            }
             goto fail;
         }
 

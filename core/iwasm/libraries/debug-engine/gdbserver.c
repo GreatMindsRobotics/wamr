@@ -150,21 +150,21 @@ wasm_gdbserver_accept(WASMGDBServer *server)
 
     LOG_VERBOSE("waiting for gdb client to connect...");
 
-    os_socket_accept(server->listen_fd, &sockt_fd, NULL, NULL);
-    if (sockt_fd < 0) {
-        LOG_ERROR("wasm gdb server error: socket accept failed");
-        goto fail;
+    /* The result, not sockt_fd, says whether accept failed: on Windows
+     * bh_socket_t is a pointer, never < 0, and a failed accept leaves it
+     * pointing at the handle it just freed. A failed accept also leaves
+     * listen_fd alone. It fails when wasm_close_gdbserver closes the
+     * listening socket under it, which frees that handle on Windows,
+     * and wasm_close_gdbserver closes listen_fd in every other case. */
+    if (os_socket_accept(server->listen_fd, &sockt_fd, NULL, NULL)
+        != BHT_OK) {
+        return false;
     }
 
     LOG_VERBOSE("accept gdb client");
     server->socket_fd = sockt_fd;
     server->noack = false;
     return true;
-
-fail:
-    os_socket_shutdown(server->listen_fd);
-    os_socket_close(server->listen_fd);
-    return false;
 }
 
 void
