@@ -890,9 +890,26 @@ notify_debug_instance_exit(WASMExecEnv *exec_env)
     on_thread_exit_event(cluster->debug_inst, exec_env);
 }
 
+bool
+wasm_cluster_thread_is_debugged(WASMExecEnv *exec_env)
+{
+    WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);
+
+    return cluster != NULL && cluster->debug_inst != NULL;
+}
+
 void
 wasm_cluster_thread_waiting_run(WASMExecEnv *exec_env)
 {
+    /* No debug instance means no debugger will ever resume this thread:
+     * the debug-engine's qWasmCall runs on an exec_env of its own
+     * cluster. Waiting would hang the call, so carry on instead; a trap
+     * then returns to the caller with its exception set. */
+    if (!wasm_cluster_thread_is_debugged(exec_env)) {
+        wasm_cluster_clear_thread_signal(exec_env);
+        return;
+    }
+
     exec_env->current_status->running_status = STATUS_STOP;
     notify_debug_instance(exec_env);
 
