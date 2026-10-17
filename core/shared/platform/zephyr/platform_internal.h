@@ -302,6 +302,22 @@ typedef unsigned int os_nfds_t;
 
 #define FIONREAD ZFD_IOCTL_FIONREAD
 
+/* Zephyr defines the POSIX byte-order names only when the socket API is
+ * built (CONFIG_NET_SOCKETS); libc-wasi's address conversions use them
+ * either way. */
+#ifndef htons
+#define htons(x) net_htons(x)
+#endif
+#ifndef htonl
+#define htonl(x) net_htonl(x)
+#endif
+#ifndef ntohs
+#define ntohs(x) net_ntohs(x)
+#endif
+#ifndef ntohl
+#define ntohl(x) net_ntohl(x)
+#endif
+
 typedef struct timespec os_timespec;
 
 #ifndef CLOCK_REALTIME
