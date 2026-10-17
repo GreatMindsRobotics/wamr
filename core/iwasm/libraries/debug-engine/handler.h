@@ -8,6 +8,8 @@
 
 #include "gdbserver.h"
 
+struct WASMModuleCommon;
+
 int
 wasm_debug_handler_init(void);
 
@@ -18,6 +20,12 @@ wasm_debug_handler_deinit(void);
  * qWasmLoadSide keeps for its main module. */
 void
 wasm_debug_handler_session_ended(void);
+
+/* `module` is about to be freed; forget it if it is the registered
+ * main module, so a later module at the same address is not mistaken
+ * for it. */
+void
+wasm_debug_handler_module_unloaded(struct WASMModuleCommon *module);
 
 void
 handle_interrupt(WASMGDBServer *server);

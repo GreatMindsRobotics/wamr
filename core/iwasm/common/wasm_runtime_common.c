@@ -1103,6 +1103,28 @@ wasm_runtime_start_debug_instance(WASMExecEnv *exec_env)
 }
 #endif
 
+static void
+unload_module_internal(WASMModuleCommon *module)
+{
+#if WASM_ENABLE_DEBUG_INTERP != 0
+    wasm_debug_engine_module_unloaded(module);
+#endif
+
+#if WASM_ENABLE_INTERP != 0
+    if (module->module_type == Wasm_Module_Bytecode) {
+        wasm_unload((WASMModule *)module);
+        return;
+    }
+#endif
+
+#if WASM_ENABLE_AOT != 0
+    if (module->module_type == Wasm_Module_AoT) {
+        aot_unload((AOTModule *)module);
+        return;
+    }
+#endif
+}
+
 #if WASM_ENABLE_MULTI_MODULE != 0
 static module_reader reader;
 static module_destroyer destroyer;
@@ -1127,15 +1149,24 @@ wasm_runtime_get_module_destroyer()
 }
 
 static WASMRegisteredModule *
+wasm_runtime_find_module_registered_by_reference_nolock(
+    const WASMModuleCommon *module)
+{
+    WASMRegisteredModule *reg_module = bh_list_first_elem(registered_module_list);
+
+    while (reg_module && module != reg_module->module) {
+        reg_module = bh_list_elem_next(reg_module);
+    }
+    return reg_module;
+}
+
+static WASMRegisteredModule *
 wasm_runtime_find_module_registered_by_reference(WASMModuleCommon *module)
 {
     WASMRegisteredModule *reg_module = NULL;
 
     os_mutex_lock(&registered_module_list_lock);
-    reg_module = bh_list_first_elem(registered_module_list);
-    while (reg_module && module != reg_module->module) {
-        reg_module = bh_list_elem_next(reg_module);
-    }
+    reg_module = wasm_runtime_find_module_registered_by_reference_nolock(module);
     os_mutex_unlock(&registered_module_list_lock);
 
     return reg_module;
@@ -1266,6 +1297,94 @@ wasm_runtime_find_module_registered(const char *module_name)
     return module ? module->module : NULL;
 }
 
+/* Unloads a module the registry no longer lists, then the file buffer
+ * the sub-module reader gave it, which the module may point into. */
+static void
+release_registered_module(WASMRegisteredModule *reg_module)
+{
+    unload_module_internal(reg_module->module);
+
+    if (destroyer && reg_module->orig_file_buf) {
+        destroyer(reg_module->orig_file_buf, reg_module->orig_file_buf_size);
+        reg_module->orig_file_buf = NULL;
+        reg_module->orig_file_buf_size = 0;
+    }
+
+    wasm_runtime_free(reg_module);
+}
+
+static bh_list *
+get_import_module_list(const WASMModuleCommon *module)
+{
+#if WASM_ENABLE_INTERP != 0
+    if (module->module_type == Wasm_Module_Bytecode) {
+        return ((WASMModule *)module)->import_module_list;
+    }
+#endif
+#if WASM_ENABLE_AOT != 0
+    if (module->module_type == Wasm_Module_AoT) {
+        return ((AOTModule *)module)->import_module_list;
+    }
+#endif
+    return NULL;
+}
+
+/* Whether a registered module other than `module` imports from it.
+ * Every module wasm_runtime_load returns is registered, so the
+ * registry sees every possible importer. Call with
+ * registered_module_list_lock held. */
+static bool
+module_has_dependents(const WASMModuleCommon *module)
+{
+    WASMRegisteredModule *reg_module = bh_list_first_elem(registered_module_list);
+
+    while (reg_module) {
+        if (reg_module->module != module) {
+            bh_list *imports = get_import_module_list(reg_module->module);
+            WASMRegisteredModule *import = NULL;
+
+            if (imports) {
+                import = bh_list_first_elem(imports);
+            }
+            while (import) {
+                if (import->module == module) {
+                    return true;
+                }
+                import = bh_list_elem_next(import);
+            }
+        }
+        reg_module = bh_list_elem_next(reg_module);
+    }
+    return false;
+}
+
+/* Frees every module whose unload was deferred and that nothing
+ * imports from any more. One pass can free the last importer of
+ * another deferred module, so it repeats until a pass frees none. */
+static void
+unload_deferred_modules(void)
+{
+    WASMRegisteredModule *reg_module;
+
+    do {
+        os_mutex_lock(&registered_module_list_lock);
+        reg_module = bh_list_first_elem(registered_module_list);
+        while (reg_module
+               && !(reg_module->unload_requested
+                    && !module_has_dependents(reg_module->module))) {
+            reg_module = bh_list_elem_next(reg_module);
+        }
+        if (reg_module) {
+            bh_list_remove(registered_module_list, reg_module);
+        }
+        os_mutex_unlock(&registered_module_list_lock);
+
+        if (reg_module) {
+            release_registered_module(reg_module);
+        }
+    } while (reg_module);
+}
+
 /*
  * simply destroy all
  */
@@ -1282,26 +1401,7 @@ wasm_runtime_destroy_registered_module_list()
         bh_list_remove(registered_module_list, reg_module);
 
         /* now, it is time to release every module in the runtime */
-        if (reg_module->module->module_type == Wasm_Module_Bytecode) {
-#if WASM_ENABLE_INTERP != 0
-            wasm_unload((WASMModule *)reg_module->module);
-#endif
-        }
-        else {
-#if WASM_ENABLE_AOT != 0
-            aot_unload((AOTModule *)reg_module->module);
-#endif
-        }
-
-        /* destroy the file buffer */
-        if (destroyer && reg_module->orig_file_buf) {
-            destroyer(reg_module->orig_file_buf,
-                      reg_module->orig_file_buf_size);
-            reg_module->orig_file_buf = NULL;
-            reg_module->orig_file_buf_size = 0;
-        }
-
-        wasm_runtime_free(reg_module);
+        release_registered_module(reg_module);
         reg_module = next_reg_module;
     }
     os_mutex_unlock(&registered_module_list_lock);
@@ -1612,25 +1712,35 @@ void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
 #if WASM_ENABLE_MULTI_MODULE != 0
-    /**
-     * since we will unload and free all module when runtime_destroy()
-     * we don't want users to unwillingly disrupt it
-     */
-    return;
-#endif
+    /* Other modules link against a module through the registry, and a
+     * module that one of them imports from must outlive it. Such a
+     * module is only marked here, and freed once its last importer is
+     * unloaded (or at wasm_runtime_destroy). */
+    WASMRegisteredModule *reg_module;
 
-#if WASM_ENABLE_INTERP != 0
-    if (module->module_type == Wasm_Module_Bytecode) {
-        wasm_unload((WASMModule *)module);
+    os_mutex_lock(&registered_module_list_lock);
+    reg_module = wasm_runtime_find_module_registered_by_reference_nolock(module);
+    if (module_has_dependents(module)) {
+        if (reg_module) {
+            reg_module->unload_requested = true;
+        }
+        os_mutex_unlock(&registered_module_list_lock);
         return;
     }
-#endif
-
-#if WASM_ENABLE_AOT != 0
-    if (module->module_type == Wasm_Module_AoT) {
-        aot_unload((AOTModule *)module);
-        return;
+    if (reg_module) {
+        bh_list_remove(registered_module_list, reg_module);
     }
+    os_mutex_unlock(&registered_module_list_lock);
+
+    if (reg_module) {
+        release_registered_module(reg_module);
+    }
+    else {
+        unload_module_internal(module);
+    }
+    unload_deferred_modules();
+#else
+    unload_module_internal(module);
 #endif
 }
 

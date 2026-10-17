@@ -41,9 +41,11 @@ static char *tmpbuf;
 static korp_mutex tmpbuf_lock;
 
 /* The main module registered under the qWasmLoadSide registry name, or NULL.
- * Compared, never dereferenced: after a session ends it may name a
- * module the registry has already freed. */
+ * Cleared when the session ends and when that module is unloaded. */
 static wasm_module_t g_main_registered = NULL;
+
+static void
+free_all_side_modules(bool modules_already_freed);
 
 int
 wasm_debug_handler_init(void)
@@ -65,6 +67,9 @@ wasm_debug_handler_init(void)
 void
 wasm_debug_handler_deinit(void)
 {
+    /* The runtime frees every registered module before it destroys the
+     * debug engine, so only the list's own memory is left to free. */
+    free_all_side_modules(true);
     g_main_registered = NULL;
     wasm_runtime_free(tmpbuf);
     tmpbuf = NULL;
@@ -590,10 +595,26 @@ destroy_side_module(WasmSideModule *target)
     }
 }
 
-/* Take the name off the module registered as the main one. Under
- * MULTI_MODULE wasm_runtime_unload is a no-op and the registry owns
- * every loaded module until wasm_runtime_destroy, so the module goes
- * back on the list unnamed: it is still freed there, and side modules
+/* Unlinks and frees every side module. With `modules_already_freed`,
+ * the runtime has unloaded their modules already, so only the list's
+ * own memory is freed. */
+static void
+free_all_side_modules(bool modules_already_freed)
+{
+    while (g_side_modules) {
+        WasmSideModule *m = g_side_modules;
+        g_side_modules = m->next;
+        if (modules_already_freed) {
+            m->instance = NULL;
+            m->module = NULL;
+        }
+        free_side_module(m);
+    }
+}
+
+/* Take the name off the module registered as the main one. It goes back
+ * on the registry unnamed, as wasm_runtime_load left it, so the
+ * embedder's wasm_runtime_unload still frees it, and side modules
  * loaded for a later session no longer bind to it. A module the
  * registry no longer lists is left alone. */
 static void
@@ -617,7 +638,19 @@ forget_main_registration(void)
 void
 wasm_debug_handler_session_ended(void)
 {
+    /* Side modules import from the main module, and wasm_runtime_unload
+     * defers freeing a module that something imports from. Freeing them
+     * first lets the embedder's unload of the main module free it. */
+    free_all_side_modules(false);
     forget_main_registration();
+}
+
+void
+wasm_debug_handler_module_unloaded(struct WASMModuleCommon *module)
+{
+    if (module == g_main_registered) {
+        g_main_registered = NULL;
+    }
 }
 
 /* Register the main module under SIDE_MAIN_REGISTRY_NAME so side
