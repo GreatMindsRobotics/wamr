@@ -169,6 +169,7 @@ wasm_gdbserver_accept(WASMGDBServer *server)
     LOG_VERBOSE("accept gdb client");
     server->socket_fd = sockt_fd;
     server->noack = false;
+    server->link_closed = false;
     return true;
 }
 
@@ -183,6 +184,7 @@ wasm_gdbserver_detach(WASMGDBServer *server)
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
         server->socket_fd = (bh_socket_t)-1;
+        server->link_closed = true;
     }
 }
 

@@ -70,6 +70,11 @@ typedef struct WASMGDBServer {
      * they are replayed by the next wasm_gdbserver_handle_packet. */
     char deferred[256];
     int32 deferred_len;
+    /* The client is gone, so write_data_raw drops every write until the
+     * next accept: a send on the closed socket kills the process
+     * (SIGPIPE, or write_data_raw's exit on a failed send). Packets
+     * deferred during a qWasmCall are still processed. */
+    bool link_closed;
 } WASMGDBServer;
 
 WASMGDBServer *

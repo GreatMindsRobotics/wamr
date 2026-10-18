@@ -324,7 +324,6 @@ typedef struct WasmCallJob {
     bool ok;
     bool done;
     bool aborted;
-    bool link_closed;
 } WasmCallJob;
 
 static void *
@@ -386,7 +385,6 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
     job->ok = false;
     job->done = false;
     job->aborted = false;
-    job->link_closed = false;
     if (os_mutex_init(&job->lock) != 0) {
         return false;
     }
@@ -431,9 +429,9 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
             continue;
         }
         if (n <= 0) {
-            /* Nobody is left to read the result. The next
-             * handle_packet sees the closed link and detaches. */
-            job->link_closed = true;
+            /* Nobody is left to read the result, or the reply to
+             * anything deferred. */
+            server->link_closed = true;
             wasm_call_job_abort(job);
             break;
         }
@@ -1149,7 +1147,6 @@ process_wasm_call(WASMGDBServer *server, char *args)
     char ret_hex[256];
     WasmCallJob job;
     bool aborted = false;
-    bool link_closed = false;
     uint32 side_handle = 0;
     WasmSideModule *side = NULL;
 
@@ -1322,7 +1319,6 @@ process_wasm_call(WASMGDBServer *server, char *args)
     if (run_call_interruptible(server, &job)) {
         ok = job.ok;
         aborted = job.aborted;
-        link_closed = job.link_closed;
     }
     else {
         ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
@@ -1350,11 +1346,7 @@ process_wasm_call(WASMGDBServer *server, char *args)
             mem2hex((char *)msg, msg_hex, (int32)strlen(msg));
             snprintf(tmpbuf, MAX_PACKET_SIZE, "ERR:aborted:%s:%s", msg_hex,
                      stdout_hex);
-            /* A send on the closed link fails, and write_data_raw exits
-             * the process on a failed send. */
-            if (!link_closed) {
-                write_packet(server, tmpbuf);
-            }
+            write_packet(server, tmpbuf);
             wasm_runtime_set_exception(module_inst, NULL);
             wasm_runtime_destroy_exec_env(call_env);
             os_mutex_unlock(&tmpbuf_lock);
