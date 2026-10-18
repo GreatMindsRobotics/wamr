@@ -149,7 +149,16 @@ set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
-add_executable (iwasm main.c ${UNCOMMON_SHARED_SOURCE})
+# The Clay runtime sources and NativeSymbol tables every embedder
+# compiles in (see that file for why the host iwasm needs them).
+include (${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime/natives/clay_natives.cmake)
+
+add_executable (iwasm main.c
+                ${CLAY_MOCK_NATIVES_C}
+                ${CLAY_RT_NATIVES_C}
+                ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
+target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
+target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
 
 set_version_info (iwasm)
 

@@ -146,31 +146,13 @@ endif ()
 
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
-# Option 2 (runtime-as-imports): mirror darwin/CMakeLists.txt §128-149.
-# The 6 pure Clay runtime .c files (clay_panic, clay_format, clay_check,
-# clay_intrinsics, clay_string, clay_f16) compile into iwasm as native
-# C and provide the function bodies that user wasms now import under
-# module "clay_rt".  The wrapper layer is clay_rt_natives.c, auto-
-# generated from clay_runtime.h by gen_clay_rt_natives.py.  Its output
-# is host-agnostic, so there is a single copy at
-# Clay/runtime/natives/clay_rt_natives.c shared by every embedder
-# (host iwasm, Brickyard controller, Nucleo firmware).  Without these sources,
-# iwasm can't instantiate any wasm built with -DCLAY_RUNTIME_AS_IMPORTS,
-# which is what Sculptor's clay-host build mode produces.
-set (CLAY_RUNTIME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime)
-set (CLAY_NATIVES_DIR ${CLAY_RUNTIME_DIR}/natives)
-set (CLAY_RUNTIME_SOURCES
-  ${CLAY_RUNTIME_DIR}/clay_panic.c
-  ${CLAY_RUNTIME_DIR}/clay_format.c
-  ${CLAY_RUNTIME_DIR}/clay_check.c
-  ${CLAY_RUNTIME_DIR}/clay_intrinsics.c
-  ${CLAY_RUNTIME_DIR}/clay_string.c
-  ${CLAY_RUNTIME_DIR}/clay_f16.c
-)
+# The Clay runtime sources and NativeSymbol tables every embedder
+# compiles in (see that file for why the host iwasm needs them).
+include (${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime/natives/clay_natives.cmake)
 
 add_executable (iwasm main.c
-                ${CLAY_NATIVES_DIR}/clay_mock_natives.c
-                ${CLAY_NATIVES_DIR}/clay_rt_natives.c
+                ${CLAY_MOCK_NATIVES_C}
+                ${CLAY_RT_NATIVES_C}
                 ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
 target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
 target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
