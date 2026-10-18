@@ -65,6 +65,11 @@ typedef struct WASMGDBServer {
     bool noack;
     struct WASMDebugControlThread *thread;
     rsp_recv_context_t *receive_ctx;
+    /* Bytes that arrived while a qWasmCall was running on its worker
+     * thread. The packet being served still owns receive_buffer, so
+     * they are replayed by the next wasm_gdbserver_handle_packet. */
+    char deferred[256];
+    int32 deferred_len;
 } WASMGDBServer;
 
 WASMGDBServer *
@@ -84,4 +89,11 @@ wasm_close_gdbserver(WASMGDBServer *server);
 
 bool
 wasm_gdbserver_handle_packet(WASMGDBServer *server);
+
+/* Read raw bytes without framing them. Returns the byte count, 0 when
+ * the peer closed the connection, -1 when nothing arrived within
+ * timeout_ms, and -2 on a transport error. */
+int32
+wasm_gdbserver_recv_raw(WASMGDBServer *server, char *buf, int32 len,
+                        uint32 timeout_ms);
 #endif

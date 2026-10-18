@@ -320,6 +320,42 @@ on_rsp_byte_arrive(unsigned char ch, rsp_recv_context_t *ctx)
     return 0;
 }
 
+int32
+wasm_gdbserver_recv_raw(WASMGDBServer *server, char *buf, int32 len,
+                        uint32 timeout_ms)
+{
+    int32 n;
+    const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+
+    if (t != NULL) {
+        /* A UART has no EOF, so the transport's 0 is "nothing yet". */
+        n = (int32)t->recv(t->ctx, buf, (size_t)len, timeout_ms);
+        if (n <= 0) {
+            return -1;
+        }
+        return n;
+    }
+
+    if (os_socket_settimeout(server->socket_fd, (uint64)timeout_ms * 1000)
+        != 0) {
+        return -2;
+    }
+
+    n = os_socket_recv(server->socket_fd, buf, (unsigned int)len);
+    if (n >= 0) {
+        return n;
+    }
+#if defined(BH_PLATFORM_WINDOWS)
+    if (WSAGetLastError() == WSAETIMEDOUT)
+#else
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+#endif
+    {
+        return -1;
+    }
+    return -2;
+}
+
 bool
 wasm_gdbserver_handle_packet(WASMGDBServer *server)
 {
@@ -330,6 +366,12 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
      * UART transports don't have a settimeout()-style knob; the
      * 1000 ms wait is part of the recv() contract instead. */
     const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+    if (server->deferred_len > 0) {
+        n = server->deferred_len;
+        memcpy(buf, server->deferred, (size_t)n);
+        server->deferred_len = 0;
+        goto rx_done;
+    }
     if (t != NULL) {
         n = (int32)t->recv(t->ctx, buf, sizeof(buf), 1000);
         if (n == 0) {

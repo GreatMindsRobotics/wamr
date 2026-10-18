@@ -261,20 +261,161 @@ process_wasm_global(WASMGDBServer *server, char *args)
  * Reply (OK):   OK:<retbytes-hex>:<stdout-hex>
  * Reply (Err):  ERR:<code>:<message-hex>:<stdout-hex>
  *
- * See Sculptor/plans/wamr_inferior_call_plan.md. This is the
- * synchronous skeleton — it parses the request, runs the call
+ * See Sculptor/plans/wamr_inferior_call_plan.md. It parses the
+ * request, runs the call
  * against a derived exec_env that shares the paused module instance,
  * and sends the reply through the normal query-reply path. The
  * paused frame stays untouched because we never reuse the original
  * exec_env's stack.
  *
- * Limitations (tracked as follow-ups, not blockers for the
- * differential test infrastructure):
- *  - Synchronous: the handler blocks the gdbserver loop for the call
- *    duration. \x03 interruption requires the Part A2 worker thread.
- *  - No stdout capture: wasi fd_write goes to the host's normal sink.
- *    Part B2 adds a per-call override.
+ * The call itself runs on a worker thread (Part A2) while this thread
+ * keeps reading the link, so a \x03 sent mid-call aborts it and the
+ * reply is ERR:aborted. Other bytes that arrive meanwhile are deferred
+ * and served after the reply. If no worker thread can be started (an
+ * embedded target out of thread stacks), the call runs synchronously
+ * and cannot be interrupted.
  */
+
+/* How long each poll of the link waits while a call is in flight. It
+ * bounds both the extra latency a finished call's reply sees and how
+ * long a \x03 can sit unread. */
+#define WASM_CALL_POLL_MS 5
+
+typedef struct WasmCallJob {
+    wasm_exec_env_t env;
+    wasm_function_inst_t func;
+    uint32 argc;
+    uint32 *argv;
+    korp_mutex lock;
+    korp_cond cond;
+    bool ok;
+    bool done;
+    bool aborted;
+} WasmCallJob;
+
+static void *
+wasm_call_worker(void *arg)
+{
+    WasmCallJob *job = (WasmCallJob *)arg;
+    bool ok = wasm_runtime_call_wasm(job->env, job->func, job->argc, job->argv);
+
+    os_mutex_lock(&job->lock);
+    job->ok = ok;
+    job->done = true;
+    os_cond_signal(&job->cond);
+    os_mutex_unlock(&job->lock);
+    return NULL;
+}
+
+static bool
+wasm_call_job_done(WasmCallJob *job)
+{
+    bool done;
+
+    os_mutex_lock(&job->lock);
+    done = job->done;
+    os_mutex_unlock(&job->lock);
+    return done;
+}
+
+/* The derived exec_env is in a cluster of its own, apart from the
+ * paused program's, so WAMR_SIG_TERM reaches only the inferior call:
+ * the interpreter returns at its next suspend check (taken branches,
+ * calls, returns) and the paused program never sees it. A call blocked
+ * inside a host import aborts once the import returns. A call that
+ * already finished is left alone, except in the short window between
+ * wasm_runtime_call_wasm returning and the worker marking it done,
+ * where the reply still says aborted. */
+static void
+wasm_call_job_abort(WasmCallJob *job)
+{
+    os_mutex_lock(&job->lock);
+    if (!job->done && !job->aborted) {
+        os_mutex_lock(&job->env->wait_lock);
+        wasm_cluster_thread_send_signal(job->env, WAMR_SIG_TERM);
+        os_mutex_unlock(&job->env->wait_lock);
+        job->aborted = true;
+    }
+    os_mutex_unlock(&job->lock);
+}
+
+/* Run the call on a worker thread and serve the link until it ends.
+ * Returns false, having run nothing, when the worker cannot be
+ * started. */
+static bool
+run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
+{
+    korp_tid tid;
+    char buf[256];
+    int32 n, i, room;
+
+    job->ok = false;
+    job->done = false;
+    job->aborted = false;
+    if (os_mutex_init(&job->lock) != 0) {
+        return false;
+    }
+    if (os_cond_init(&job->cond) != 0) {
+        os_mutex_destroy(&job->lock);
+        return false;
+    }
+    if (os_thread_create(&tid, wasm_call_worker, job,
+                         APP_THREAD_STACK_SIZE_DEFAULT)
+        != 0) {
+        os_cond_destroy(&job->cond);
+        os_mutex_destroy(&job->lock);
+        return false;
+    }
+
+    while (!wasm_call_job_done(job)) {
+        /* wasm_debug_control_thread_destroy sets STOPPED before it
+         * waits for this thread to drop the control thread's lock, so a
+         * runaway call with no \x03 coming would block teardown. */
+        if (server->thread->status == STOPPED) {
+            wasm_call_job_abort(job);
+            break;
+        }
+        /* Read no more than the deferred buffer can hold, so nothing
+         * is dropped; the rest waits in the transport. A \x03 needs no
+         * room, but it cannot be seen until the buffer drains. */
+        room = (int32)sizeof(server->deferred) - server->deferred_len;
+        if (room > (int32)sizeof(buf)) {
+            room = (int32)sizeof(buf);
+        }
+        if (room == 0) {
+            os_mutex_lock(&job->lock);
+            if (!job->done) {
+                os_cond_reltimedwait(&job->cond, &job->lock,
+                                     WASM_CALL_POLL_MS * 1000);
+            }
+            os_mutex_unlock(&job->lock);
+            continue;
+        }
+        n = wasm_gdbserver_recv_raw(server, buf, room, WASM_CALL_POLL_MS);
+        if (n == -1) {
+            continue;
+        }
+        if (n <= 0) {
+            /* Nobody is left to read the result. The next
+             * handle_packet sees the closed link and detaches. */
+            wasm_call_job_abort(job);
+            break;
+        }
+        for (i = 0; i < n; i++) {
+            if (buf[i] == 0x03) {
+                wasm_call_job_abort(job);
+            }
+            else {
+                server->deferred[server->deferred_len++] = buf[i];
+            }
+        }
+    }
+
+    os_thread_join(tid, NULL);
+    os_cond_destroy(&job->cond);
+    os_mutex_destroy(&job->lock);
+    return true;
+}
 
 /* Map WAMR's exception string to one of the trap codes the wire
  * format documents. Falls back to "trap" when nothing matches. */
@@ -907,6 +1048,8 @@ process_wasm_call(WASMGDBServer *server, char *args)
     wasm_exec_env_t call_env = NULL;
     bool ok;
     char ret_hex[256];
+    WasmCallJob job;
+    bool aborted = false;
     uint32 side_handle = 0;
     WasmSideModule *side = NULL;
 
@@ -1072,7 +1215,17 @@ process_wasm_call(WASMGDBServer *server, char *args)
      * reply's <stdout-hex> field. */
     wasm_debug_stdout_capture_begin();
 
-    ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
+    job.env = call_env;
+    job.func = func;
+    job.argc = cell_idx;
+    job.argv = argv_cells;
+    if (run_call_interruptible(server, &job)) {
+        ok = job.ok;
+        aborted = job.aborted;
+    }
+    else {
+        ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
+    }
 
     {
         const char *captured_stdout = NULL;
@@ -1086,6 +1239,21 @@ process_wasm_call(WASMGDBServer *server, char *args)
         }
         else {
             stdout_hex[0] = '\0';
+        }
+
+        if (aborted) {
+            /* WAMR_SIG_TERM unwinds without an exception, so ok may
+             * be true here; the result cells are not a result. */
+            const char *msg = "call aborted by debugger interrupt";
+            char msg_hex[128];
+            mem2hex((char *)msg, msg_hex, (int32)strlen(msg));
+            snprintf(tmpbuf, MAX_PACKET_SIZE, "ERR:aborted:%s:%s", msg_hex,
+                     stdout_hex);
+            write_packet(server, tmpbuf);
+            wasm_runtime_set_exception(module_inst, NULL);
+            wasm_runtime_destroy_exec_env(call_env);
+            os_mutex_unlock(&tmpbuf_lock);
+            return;
         }
 
         if (!ok) {
