@@ -1653,6 +1653,13 @@ wasm_mmap_linear_memory(uint64 map_size, uint64 commit_size)
     return wasm_mremap_linear_memory(NULL, 0, map_size, commit_size);
 }
 
+/* The placeholder wasm_allocate_linear_memory hands out while
+ * g_clay_skip_side_linear_memory is set, on builds that check bounds
+ * in software. It is static, so freeing it is a no-op: going through
+ * the munmap path, a heap placeholder leaked on every platform whose
+ * os_munmap does not take heap pointers. */
+static uint64 g_clay_side_memory_placeholder;
+
 static bool
 wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
                              WASMMemoryInstance *memory, uint32 inc_page_count)
@@ -1668,6 +1675,13 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     enlarge_memory_error_reason_t failure_reason = INTERNAL_ERROR;
 
     if (!memory) {
+        ret = false;
+        goto return_func;
+    }
+
+    /* Growing would hand the static placeholder to os_mremap, which
+     * frees the old block: BH_FREE on Zephyr, a heap corruption. */
+    if (memory->memory_data == (uint8 *)&g_clay_side_memory_placeholder) {
         ret = false;
         goto return_func;
     }
@@ -2016,13 +2030,6 @@ wasm_memory_enlarge(WASMMemoryInstance *memory, uint64 inc_page_count)
 
     return ret;
 }
-
-/* The placeholder wasm_allocate_linear_memory hands out while
- * g_clay_skip_side_linear_memory is set, on builds that check bounds
- * in software. It is static, so freeing it is a no-op: going through
- * the munmap path, a heap placeholder leaked on every platform whose
- * os_munmap does not take heap pointers. */
-static uint64 g_clay_side_memory_placeholder;
 
 void
 wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
