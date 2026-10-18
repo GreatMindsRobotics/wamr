@@ -2017,6 +2017,13 @@ wasm_memory_enlarge(WASMMemoryInstance *memory, uint64 inc_page_count)
     return ret;
 }
 
+/* The placeholder wasm_allocate_linear_memory hands out while
+ * g_clay_skip_side_linear_memory is set, on builds that check bounds
+ * in software. It is static, so freeing it is a no-op: going through
+ * the munmap path, a heap placeholder leaked on every platform whose
+ * os_munmap does not take heap pointers. */
+static uint64 g_clay_side_memory_placeholder;
+
 void
 wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
 {
@@ -2024,6 +2031,11 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
 
     bh_assert(memory_inst);
     bh_assert(memory_inst->memory_data);
+
+    if (memory_inst->memory_data == (uint8 *)&g_clay_side_memory_placeholder) {
+        memory_inst->memory_data = NULL;
+        return;
+    }
 
 #ifndef OS_ENABLE_HW_BOUND_CHECK
 #if WASM_ENABLE_SHARED_MEMORY != 0
@@ -2064,7 +2076,7 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
  * memory is dead weight — and on an embedded target there is no room
  * for it after main wasm + parsed module + debug-engine state. The
  * placeholder satisfies wasm_deallocate_linear_memory's
- * bh_assert(memory_data) without consuming a wasm page.
+ * bh_assert(memory_data) without allocating anything.
  *
  * Also paired with a check in wasm_runtime.c's data segment init loop
  * to skip the per-segment copy into this fake memory (the handler
@@ -2083,17 +2095,25 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
     bh_assert(memory_data_size);
 
     if (g_clay_skip_side_linear_memory) {
-        /* 8-byte placeholder: large enough for the 8-byte alignment
-         * assert at the end of this function, small enough not to
-         * compete with the real 64 KiB page for heap.
-         * The next BH_FREE in wasm_munmap_linear_memory uses just
-         * the pointer, not the size — so freeing 8 bytes through a
-         * "64 KB-sized" frame works correctly. */
-        *data = wasm_runtime_malloc(8);
+        *memory_data_size = 0;
+#if defined(OS_ENABLE_HW_BOUND_CHECK) && WASM_MEM_ALLOC_WITH_USAGE == 0
+        /* With hardware bounds checks the interpreter does no software
+         * check, so a load or store goes straight to memory_data +
+         * address and only a fault stops it. A static placeholder has
+         * nothing behind it to fault on. Reserve the usual 8 GiB guard
+         * region instead, with nothing committed: every access traps
+         * "out of bounds memory access", as memory_data_size 0 does on
+         * software-checked builds, and no physical memory is used. */
+        *data = wasm_mmap_linear_memory(8 * (uint64)BH_GB, 0);
         if (!*data) {
             return BHT_ERROR;
         }
-        *memory_data_size = 0;
+#else
+        /* Shared by every side instance and never written: its data
+         * segments are skipped, and memory_data_size 0 fails every
+         * bounds check. */
+        *data = (uint8 *)&g_clay_side_memory_placeholder;
+#endif
         return BHT_OK;
     }
 

@@ -340,6 +340,12 @@ wasm_debug_engine_destroy(void)
     }
 }
 
+void
+wasm_debug_engine_module_unloaded(WASMModuleCommon *module)
+{
+    wasm_debug_handler_module_unloaded(module);
+}
+
 bool
 wasm_debug_engine_init(char *ip_addr, int32 process_port)
 {

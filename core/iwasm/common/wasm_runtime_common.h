@@ -580,6 +580,10 @@ typedef struct WASMRegisteredModule {
     /* to store the original module file buffer address */
     uint8 *orig_file_buf;
     uint32 orig_file_buf_size;
+    /* wasm_runtime_unload was called while another module still
+     * imported from this one; it is freed once the last such importer
+     * is unloaded. */
+    bool unload_requested;
 } WASMRegisteredModule;
 #endif
 

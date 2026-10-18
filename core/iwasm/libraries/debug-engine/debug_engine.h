@@ -135,6 +135,11 @@ wasm_debug_engine_init(char *ip_addr, int32 process_port);
 void
 wasm_debug_engine_destroy(void);
 
+/* `module` is about to be freed. Called by wasm_runtime_unload and
+ * runtime teardown, whether or not a debug engine is running. */
+void
+wasm_debug_engine_module_unloaded(WASMModuleCommon *module);
+
 WASMExecEnv *
 wasm_debug_instance_get_current_env(WASMDebugInstance *instance);
 
