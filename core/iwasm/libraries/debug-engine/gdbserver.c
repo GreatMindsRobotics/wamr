@@ -88,6 +88,8 @@ wasm_create_gdbserver(const char *host, int *port)
 
     if (0 != os_socket_bind(listen_fd, host, port)) {
         LOG_ERROR("wasm gdb server error: socket bind failed");
+        os_socket_shutdown(listen_fd);
+        os_socket_close(listen_fd);
         goto fail;
     }
 
@@ -97,10 +99,6 @@ wasm_create_gdbserver(const char *host, int *port)
     return server;
 
 fail:
-    if (listen_fd >= 0) {
-        os_socket_shutdown(listen_fd);
-        os_socket_close(listen_fd);
-    }
     if (server->receive_ctx)
         wasm_runtime_free(server->receive_ctx);
     if (server)
