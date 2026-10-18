@@ -147,15 +147,24 @@ endif ()
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
 # The Clay runtime sources and NativeSymbol tables every embedder
-# compiles in (see that file for why the host iwasm needs them).
-include (${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime/natives/clay_natives.cmake)
-
-add_executable (iwasm main.c
-                ${CLAY_MOCK_NATIVES_C}
-                ${CLAY_RT_NATIVES_C}
-                ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
-target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
-target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
+# compiles in (see that file for why the host iwasm needs them). The
+# file lives in the OpenBrick checkout around vendor/wamr; a standalone
+# WAMR tree (upstream CI) has none and builds a plain iwasm.
+get_filename_component (CLAY_NATIVES_CMAKE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../Clay/runtime/natives/clay_natives.cmake
+  ABSOLUTE)
+if (EXISTS ${CLAY_NATIVES_CMAKE})
+  include (${CLAY_NATIVES_CMAKE})
+  add_executable (iwasm main.c
+                  ${CLAY_MOCK_NATIVES_C}
+                  ${CLAY_RT_NATIVES_C}
+                  ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
+  target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
+  target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
+else ()
+  message (STATUS "No ${CLAY_NATIVES_CMAKE}: building iwasm without the Clay natives")
+  add_executable (iwasm main.c ${UNCOMMON_SHARED_SOURCE})
+endif ()
 # vmlib's WAMR_RUNTIME_LIB_SOURCE (build-scripts/runtime_lib.cmake §209)
 # already carries PLATFORM_SHARED_SOURCE and UTILS_SHARED_SOURCE, so we
 # do NOT relist those — repeating them would feed lld-link two copies
