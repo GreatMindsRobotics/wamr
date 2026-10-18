@@ -1247,6 +1247,22 @@ wasm_runtime_unregister_module(const WASMModuleCommon *module)
     os_mutex_unlock(&registered_module_list_lock);
 }
 
+void
+wasm_runtime_clear_registered_module_name(const WASMModuleCommon *module)
+{
+    WASMRegisteredModule *registered_module = NULL;
+
+    os_mutex_lock(&registered_module_list_lock);
+    registered_module = bh_list_first_elem(registered_module_list);
+    while (registered_module && module != registered_module->module) {
+        registered_module = bh_list_elem_next(registered_module);
+    }
+    if (registered_module) {
+        registered_module->module_name = NULL;
+    }
+    os_mutex_unlock(&registered_module_list_lock);
+}
+
 WASMModuleCommon *
 wasm_runtime_find_module_registered(const char *module_name)
 {
