@@ -287,6 +287,7 @@ typedef struct WasmCallJob {
     uint32 argc;
     uint32 *argv;
     korp_mutex lock;
+    korp_cond cond;
     bool ok;
     bool done;
     bool aborted;
@@ -301,6 +302,7 @@ wasm_call_worker(void *arg)
     os_mutex_lock(&job->lock);
     job->ok = ok;
     job->done = true;
+    os_cond_signal(&job->cond);
     os_mutex_unlock(&job->lock);
     return NULL;
 }
@@ -316,11 +318,14 @@ wasm_call_job_done(WasmCallJob *job)
     return done;
 }
 
-/* The derived exec_env belongs to no cluster, so WAMR_SIG_TERM reaches
- * only the inferior call: the interpreter returns at its next suspend
- * check (taken branches, calls, returns) and the paused program never
- * sees it. A call blocked inside a host import aborts once the import
- * returns. A call that already finished is left alone. */
+/* The derived exec_env is in a cluster of its own, apart from the
+ * paused program's, so WAMR_SIG_TERM reaches only the inferior call:
+ * the interpreter returns at its next suspend check (taken branches,
+ * calls, returns) and the paused program never sees it. A call blocked
+ * inside a host import aborts once the import returns. A call that
+ * already finished is left alone, except in the short window between
+ * wasm_runtime_call_wasm returning and the worker marking it done,
+ * where the reply still says aborted. */
 static void
 wasm_call_job_abort(WasmCallJob *job)
 {
@@ -334,16 +339,6 @@ wasm_call_job_abort(WasmCallJob *job)
     os_mutex_unlock(&job->lock);
 }
 
-static void
-defer_byte(WASMGDBServer *server, char ch)
-{
-    if (server->deferred_len >= (int32)sizeof(server->deferred)) {
-        LOG_WARNING("qWasmCall: dropped a byte received during the call");
-        return;
-    }
-    server->deferred[server->deferred_len++] = ch;
-}
-
 /* Run the call on a worker thread and serve the link until it ends.
  * Returns false, having run nothing, when the worker cannot be
  * started. */
@@ -352,7 +347,7 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
 {
     korp_tid tid;
     char buf[256];
-    int32 n, i;
+    int32 n, i, room;
 
     job->ok = false;
     job->done = false;
@@ -360,16 +355,43 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
     if (os_mutex_init(&job->lock) != 0) {
         return false;
     }
+    if (os_cond_init(&job->cond) != 0) {
+        os_mutex_destroy(&job->lock);
+        return false;
+    }
     if (os_thread_create(&tid, wasm_call_worker, job,
                          APP_THREAD_STACK_SIZE_DEFAULT)
         != 0) {
+        os_cond_destroy(&job->cond);
         os_mutex_destroy(&job->lock);
         return false;
     }
 
     while (!wasm_call_job_done(job)) {
-        n = wasm_gdbserver_recv_raw(server, buf, (int32)sizeof(buf),
-                                    WASM_CALL_POLL_MS);
+        /* wasm_debug_control_thread_destroy sets STOPPED before it
+         * waits for this thread to drop the control thread's lock, so a
+         * runaway call with no \x03 coming would block teardown. */
+        if (server->thread->status == STOPPED) {
+            wasm_call_job_abort(job);
+            break;
+        }
+        /* Read no more than the deferred buffer can hold, so nothing
+         * is dropped; the rest waits in the transport. A \x03 needs no
+         * room, but it cannot be seen until the buffer drains. */
+        room = (int32)sizeof(server->deferred) - server->deferred_len;
+        if (room > (int32)sizeof(buf)) {
+            room = (int32)sizeof(buf);
+        }
+        if (room == 0) {
+            os_mutex_lock(&job->lock);
+            if (!job->done) {
+                os_cond_reltimedwait(&job->cond, &job->lock,
+                                     WASM_CALL_POLL_MS * 1000);
+            }
+            os_mutex_unlock(&job->lock);
+            continue;
+        }
+        n = wasm_gdbserver_recv_raw(server, buf, room, WASM_CALL_POLL_MS);
         if (n == -1) {
             continue;
         }
@@ -384,12 +406,13 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
                 wasm_call_job_abort(job);
             }
             else {
-                defer_byte(server, buf[i]);
+                server->deferred[server->deferred_len++] = buf[i];
             }
         }
     }
 
     os_thread_join(tid, NULL);
+    os_cond_destroy(&job->cond);
     os_mutex_destroy(&job->lock);
     return true;
 }
