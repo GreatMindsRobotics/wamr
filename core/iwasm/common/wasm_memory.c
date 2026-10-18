@@ -1679,13 +1679,6 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
         goto return_func;
     }
 
-    /* Growing would hand the static placeholder to os_mremap, which
-     * frees the old block: BH_FREE on Zephyr, a heap corruption. */
-    if (memory->memory_data == (uint8 *)&g_clay_side_memory_placeholder) {
-        ret = false;
-        goto return_func;
-    }
-
 #ifdef OS_ENABLE_HW_BOUND_CHECK
     full_size_mmaped = true;
 #elif WASM_ENABLE_SHARED_MEMORY != 0
@@ -1709,6 +1702,14 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
     if (inc_page_count <= 0)
         /* No need to enlarge memory */
         return true;
+
+    /* Growing would hand the static placeholder to realloc_func or
+     * os_mremap, which free the old block: BH_FREE on Zephyr, a heap
+     * corruption. */
+    if (memory->memory_data == (uint8 *)&g_clay_side_memory_placeholder) {
+        ret = false;
+        goto return_func;
+    }
 
     if (total_page_count < cur_page_count) { /* integer overflow */
         ret = false;
