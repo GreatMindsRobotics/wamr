@@ -38,6 +38,15 @@ static const struct packet_handler_elem packet_handler_table[255] = {
     DEL_HANDLER('D', handle_detach_request),
 };
 
+/* bh_socket_t is an int on POSIX and a handle pointer on Windows and
+ * Zephyr. 0 is what the memset on create leaves, and -1 is what a
+ * closed or never-opened socket holds. */
+static bool
+socket_is_open(bh_socket_t fd)
+{
+    return fd != (bh_socket_t)0 && fd != (bh_socket_t)-1;
+}
+
 WASMGDBServer *
 wasm_create_gdbserver(const char *host, int *port)
 {
@@ -79,6 +88,8 @@ wasm_create_gdbserver(const char *host, int *port)
 
     if (0 != os_socket_bind(listen_fd, host, port)) {
         LOG_ERROR("wasm gdb server error: socket bind failed");
+        os_socket_shutdown(listen_fd);
+        os_socket_close(listen_fd);
         goto fail;
     }
 
@@ -88,10 +99,6 @@ wasm_create_gdbserver(const char *host, int *port)
     return server;
 
 fail:
-    if (listen_fd >= 0) {
-        os_socket_shutdown(listen_fd);
-        os_socket_close(listen_fd);
-    }
     if (server->receive_ctx)
         wasm_runtime_free(server->receive_ctx);
     if (server)
@@ -162,21 +169,22 @@ wasm_gdbserver_accept(WASMGDBServer *server)
     LOG_VERBOSE("accept gdb client");
     server->socket_fd = sockt_fd;
     server->noack = false;
+    server->link_closed = false;
     return true;
 }
 
 void
 wasm_gdbserver_detach(WASMGDBServer *server)
 {
-    /* A custom transport stores (bh_socket_t)-1 in socket_fd. Where
-     * bh_socket_t is a pointer (Zephyr), that passes the > 0 test below
-     * and the shutdown dereferences 0xffffffff. There is no socket here. */
+    /* There is no socket with a custom transport. */
     if (wasm_gdbserver_get_transport() != NULL) {
         return;
     }
-    if (server->socket_fd > 0) {
+    if (socket_is_open(server->socket_fd)) {
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
+        server->socket_fd = (bh_socket_t)-1;
+        server->link_closed = true;
     }
 }
 
@@ -190,11 +198,11 @@ wasm_close_gdbserver(WASMGDBServer *server)
     if (wasm_gdbserver_get_transport() != NULL) {
         return;
     }
-    if (server->socket_fd > 0) {
+    if (socket_is_open(server->socket_fd)) {
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
     }
-    if (server->listen_fd > 0) {
+    if (socket_is_open(server->listen_fd)) {
         os_socket_shutdown(server->listen_fd);
         os_socket_close(server->listen_fd);
     }

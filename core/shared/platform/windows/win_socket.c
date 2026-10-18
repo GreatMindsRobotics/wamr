@@ -82,6 +82,8 @@ os_socket_create(bh_socket_t *sock, bool is_ipv4, bool is_tcp)
         af = AF_INET;
     }
     else {
+        BH_FREE(*sock);
+        *sock = NULL;
         errno = ENOSYS;
         return BHT_ERROR;
     }
@@ -95,6 +97,7 @@ os_socket_create(bh_socket_t *sock, bool is_ipv4, bool is_tcp)
 
     if ((*sock)->raw.socket == INVALID_SOCKET) {
         BH_FREE(*sock);
+        *sock = NULL;
         return BHT_ERROR;
     }
 
@@ -187,6 +190,7 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
 
     if ((*sock)->raw.socket == INVALID_SOCKET) {
         BH_FREE(*sock);
+        *sock = NULL;
         os_printf("socket accept failed with error %d\n", WSAGetLastError());
         return BHT_ERROR;
     }

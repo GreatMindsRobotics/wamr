@@ -429,8 +429,9 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
             continue;
         }
         if (n <= 0) {
-            /* Nobody is left to read the result. The next
-             * handle_packet sees the closed link and detaches. */
+            /* Nobody is left to read the result, or the reply to
+             * anything deferred. */
+            server->link_closed = true;
             wasm_call_job_abort(job);
             break;
         }

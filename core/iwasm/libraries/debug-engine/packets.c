@@ -19,6 +19,9 @@ write_data_raw(WASMGDBServer *gdbserver, const uint8 *data, ssize_t len)
      * reply — F5 from VSCode hangs because the wasm interpreter is
      * paused waiting on a stop-reply that never reaches the client. */
     const gdb_transport_ops_t *t = wasm_gdbserver_get_transport();
+    if (gdbserver->link_closed) {
+        return;
+    }
     if (t != NULL) {
         nwritten = t->send(t->ctx, data, len);
     }
