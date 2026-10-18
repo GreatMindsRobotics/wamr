@@ -488,6 +488,7 @@ wasm_debug_instance_destroy(WASMCluster *cluster)
     if (instance) {
         /* destroy control thread */
         wasm_debug_control_thread_destroy(instance);
+        wasm_debug_handler_session_ended();
 
         os_mutex_lock(&g_debug_engine->instance_list_lock);
         bh_list_remove(&g_debug_engine->debug_instance_list, instance);

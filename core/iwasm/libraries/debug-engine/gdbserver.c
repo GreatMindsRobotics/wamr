@@ -112,19 +112,17 @@ wasm_gdbserver_listen(WASMGDBServer *server)
         return true;
     }
 
+    /* A failed listen leaves listen_fd open: wasm_close_gdbserver closes
+     * it when the control thread is destroyed, and closing it here too
+     * closed it twice (on Windows, freeing the handle twice). */
     ret = os_socket_listen(server->listen_fd, 1);
     if (ret != 0) {
         LOG_ERROR("wasm gdb server error: socket listen failed");
-        goto fail;
+        return false;
     }
 
     LOG_VERBOSE("listen for gdb client");
     return true;
-
-fail:
-    os_socket_shutdown(server->listen_fd);
-    os_socket_close(server->listen_fd);
-    return false;
 }
 
 bool

@@ -210,6 +210,11 @@ wasm_cluster_destroy_exenv_status(WASMCurrentEnvStatus *status);
 void
 wasm_cluster_send_signal_all(WASMCluster *cluster, uint32 signo);
 
+/* Whether a debug instance watches this thread's cluster, that is,
+ * whether a stop would be reported and could be resumed. */
+bool
+wasm_cluster_thread_is_debugged(WASMExecEnv *exec_env);
+
 /* This function must be called with exec_env->wait_lock locked, otherwise we
  * may miss the signal from debugger thread, see
  * https://github.com/bytecodealliance/wasm-micro-runtime/issues/1860 */

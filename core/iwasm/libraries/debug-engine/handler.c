@@ -40,6 +40,11 @@
 static char *tmpbuf;
 static korp_mutex tmpbuf_lock;
 
+/* The main module registered under the qWasmLoadSide registry name, or NULL.
+ * Compared, never dereferenced: after a session ends it may name a
+ * module the registry has already freed. */
+static wasm_module_t g_main_registered = NULL;
+
 int
 wasm_debug_handler_init(void)
 {
@@ -60,6 +65,7 @@ wasm_debug_handler_init(void)
 void
 wasm_debug_handler_deinit(void)
 {
+    g_main_registered = NULL;
     wasm_runtime_free(tmpbuf);
     tmpbuf = NULL;
     os_mutex_destroy(&tmpbuf_lock);
@@ -68,7 +74,29 @@ wasm_debug_handler_deinit(void)
 void
 handle_interrupt(WASMGDBServer *server)
 {
-    wasm_debug_instance_interrupt_all_threads(server->thread->debug_instance);
+    WASMDebugInstance *debug_inst = server->thread->debug_instance;
+    bool stop_pending;
+
+    /* An interrupt for a program that is not running has nothing to
+     * stop. Sending WAMR_SIG_TRAP anyway leaves it pending on the
+     * stopped thread, and the next continue stops at once. A stop that
+     * is still being reported (stopped_thread set) is the same case.
+     * current_state changes only on this thread, so it can be read
+     * without a lock; execution threads set stopped_thread in
+     * on_thread_stop_event under wait_lock. A stop that lands just
+     * after this check still gets the interrupt, as it did before. */
+    if (debug_inst == NULL || debug_inst->current_state != APP_RUNNING) {
+        LOG_VERBOSE("Ignore an interrupt: the program is not running");
+        return;
+    }
+    os_mutex_lock(&debug_inst->wait_lock);
+    stop_pending = debug_inst->stopped_thread != NULL;
+    os_mutex_unlock(&debug_inst->wait_lock);
+    if (stop_pending) {
+        LOG_VERBOSE("Ignore an interrupt: a stop is being reported");
+        return;
+    }
+    wasm_debug_instance_interrupt_all_threads(debug_inst);
 }
 
 void
@@ -435,6 +463,8 @@ trap_code_from_exception(const char *exc)
         return "stackoverflow";
     if (strstr(exc, "unreachable"))
         return "panic";
+    if (strstr(exc, "breakpoint hit inside a debugger call"))
+        return "breakpoint";
     return "trap";
 }
 
@@ -530,7 +560,6 @@ typedef struct WasmSideModule {
 
 static WasmSideModule *g_side_modules = NULL;
 static uint32 g_next_side_handle = 1;
-static bool g_main_registered = false;
 
 /* Find an in-progress / loaded side module by host-chosen name. */
 static WasmSideModule *
@@ -593,20 +622,46 @@ destroy_side_module(WasmSideModule *target)
     }
 }
 
+/* Take the name off the module registered as the main one. Under
+ * MULTI_MODULE wasm_runtime_unload is a no-op and the registry owns
+ * every loaded module until wasm_runtime_destroy, so the module stays
+ * on the list unnamed: it is still freed there, and side modules
+ * loaded for a later session no longer bind to it. */
+static void
+forget_main_registration(void)
+{
+#if WASM_ENABLE_MULTI_MODULE != 0
+    if (g_main_registered != NULL
+        && wasm_runtime_find_module_registered(SIDE_MAIN_REGISTRY_NAME)
+               == g_main_registered) {
+        wasm_runtime_clear_registered_module_name(g_main_registered);
+    }
+#endif
+    g_main_registered = NULL;
+}
+
+void
+wasm_debug_handler_session_ended(void)
+{
+    forget_main_registration();
+}
+
 /* Register the main module under SIDE_MAIN_REGISTRY_NAME so side
  * modules' imports of the form `(import "main" "<sym>" ...)` resolve
- * at instantiation. Idempotent. Requires WAMR_BUILD_MULTI_MODULE=1 in
- * the build. */
+ * at instantiation. Idempotent for one main module; a different one
+ * (the program was reloaded) replaces the old registration. Requires
+ * WAMR_BUILD_MULTI_MODULE=1 in the build. */
 static bool
 ensure_main_registered(wasm_module_t main_module, char *err, size_t err_cap)
 {
-    if (g_main_registered)
+    if (g_main_registered == main_module)
         return true;
 #if WASM_ENABLE_MULTI_MODULE != 0
+    forget_main_registration();
     if (!wasm_runtime_register_module(SIDE_MAIN_REGISTRY_NAME, main_module, err,
                                       (uint32)err_cap))
         return false;
-    g_main_registered = true;
+    g_main_registered = main_module;
     return true;
 #else
     /* MULTI_MODULE disabled — IW REPL fragment loading isn't available

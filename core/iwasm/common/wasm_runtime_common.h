@@ -1077,6 +1077,12 @@ wasm_runtime_register_module_internal(const char *module_name,
 void
 wasm_runtime_unregister_module(const WASMModuleCommon *module);
 
+/* Keep the module on the registry but take its name off, so lookups by
+ * name stop finding it. A module the registry does not list is left
+ * alone. */
+void
+wasm_runtime_clear_registered_module_name(const WASMModuleCommon *module);
+
 WASMModuleCommon *
 wasm_runtime_find_module_registered(const char *module_name);
 

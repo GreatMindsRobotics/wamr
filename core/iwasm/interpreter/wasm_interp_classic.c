@@ -6542,6 +6542,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_DEBUG_INTERP != 0
             HANDLE_OP(DEBUG_OP_BREAK)
             {
+                /* A debugger's inferior call (qWasmCall) runs on an
+                 * exec_env nobody debugs, so nothing could report this
+                 * stop or resume it. Fail the call instead. */
+                if (!wasm_cluster_thread_is_debugged(exec_env)) {
+                    wasm_set_exception(module,
+                                       "breakpoint hit inside a debugger call");
+                    goto got_exception;
+                }
                 wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_TRAP);
                 WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
                                             WASM_SUSPEND_FLAG_SUSPEND);

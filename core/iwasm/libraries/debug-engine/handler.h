@@ -14,6 +14,11 @@ wasm_debug_handler_init(void);
 void
 wasm_debug_handler_deinit(void);
 
+/* A debug session's program is going away. Drops the state that
+ * qWasmLoadSide keeps for its main module. */
+void
+wasm_debug_handler_session_ended(void);
+
 void
 handle_interrupt(WASMGDBServer *server);
 
