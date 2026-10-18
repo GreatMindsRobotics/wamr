@@ -1728,12 +1728,18 @@ void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
 #if WASM_ENABLE_MULTI_MODULE != 0
+    WASMRegisteredModule *reg_module;
+#endif
+
+    if (!module) {
+        return;
+    }
+
+#if WASM_ENABLE_MULTI_MODULE != 0
     /* Other modules link against a module through the registry, and a
      * module that one of them imports from must outlive it. Such a
      * module is only marked here, and freed once its last importer is
      * unloaded (or at wasm_runtime_destroy). */
-    WASMRegisteredModule *reg_module;
-
     os_mutex_lock(&registered_module_list_lock);
     reg_module = wasm_runtime_find_module_registered_by_reference_nolock(module);
     if (module_has_dependents(module)) {

@@ -145,6 +145,11 @@ TEST_F(wasm_runtime_common_test_suite, wasm_runtime_unregister_module)
     wasm_runtime_unregister_module(nullptr);
 }
 
+TEST_F(wasm_runtime_common_test_suite, wasm_runtime_unload_null)
+{
+    wasm_runtime_unload(nullptr);
+}
+
 TEST_F(wasm_runtime_common_test_suite, wasm_runtime_find_module_registered)
 {
     EXPECT_EQ(nullptr, wasm_runtime_find_module_registered("module_test"));
