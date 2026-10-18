@@ -1727,6 +1727,10 @@ wasm_runtime_load_from_sections(WASMSection *section_list, bool is_aot,
 void
 wasm_runtime_unload(WASMModuleCommon *module)
 {
+    if (!module) {
+        return;
+    }
+
 #if WASM_ENABLE_MULTI_MODULE != 0
     /* Other modules link against a module through the registry, and a
      * module that one of them imports from must outlive it. Such a
