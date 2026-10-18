@@ -144,6 +144,14 @@ wasm_runtime_set_enlarge_mem_error_callback(
 void
 wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst);
 
+/* Sculptor IW REPL: while on, modules this thread instantiates get a
+ * placeholder linear memory (see wasm_memory.c). */
+void
+wasm_clay_skip_side_linear_memory(bool skip);
+
+bool
+wasm_clay_skipping_side_linear_memory(void);
+
 int
 wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
                             bool is_memory64, uint64 num_bytes_per_page,

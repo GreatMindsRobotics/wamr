@@ -1654,7 +1654,7 @@ wasm_mmap_linear_memory(uint64 map_size, uint64 commit_size)
 }
 
 /* The placeholder wasm_allocate_linear_memory hands out while
- * g_clay_skip_side_linear_memory is set, on builds that check bounds
+ * wasm_clay_skip_side_linear_memory is on, on builds that check bounds
  * in software. It is static: wasm_deallocate_linear_memory must skip
  * it and wasm_enlarge_memory_internal must not grow it. */
 static uint64 g_clay_side_memory_placeholder;
@@ -2075,7 +2075,7 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
     memory_inst->memory_data = NULL;
 }
 
-/* Sculptor IW REPL: when set (by the qWasmLoadSide handler in
+/* Sculptor IW REPL: while set (by the qWasmLoadSide handler in
  * core/iwasm/libraries/debug-engine/handler.c around its wasm_runtime_instantiate
  * call), skip the real linear-memory allocation and hand back a tiny
  * placeholder buffer instead. The Part I swap immediately replaces
@@ -2087,8 +2087,31 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
  *
  * Also paired with a check in wasm_runtime.c's data segment init loop
  * to skip the per-segment copy into this fake memory (the handler
- * re-copies into main's memory after the swap, task #80). */
-bool g_clay_skip_side_linear_memory = false;
+ * re-copies into main's memory after the swap, task #80).
+ *
+ * It holds the thread that set it, and applies only on that thread: a
+ * process-wide flag also gave a placeholder to any module another
+ * thread instantiated meanwhile. Only the owner writes it, and another
+ * thread's read cannot match its own id. */
+static korp_tid g_clay_skip_side_linear_memory_owner;
+
+void
+wasm_clay_skip_side_linear_memory(bool skip)
+{
+    if (skip) {
+        g_clay_skip_side_linear_memory_owner = os_self_thread();
+    }
+    else {
+        g_clay_skip_side_linear_memory_owner = 0;
+    }
+}
+
+bool
+wasm_clay_skipping_side_linear_memory(void)
+{
+    return g_clay_skip_side_linear_memory_owner != 0
+           && g_clay_skip_side_linear_memory_owner == os_self_thread();
+}
 
 int
 wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
@@ -2101,7 +2124,7 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
     bh_assert(data);
     bh_assert(memory_data_size);
 
-    if (g_clay_skip_side_linear_memory) {
+    if (wasm_clay_skipping_side_linear_memory()) {
         *memory_data_size = 0;
 #if defined(OS_ENABLE_HW_BOUND_CHECK) && WASM_MEM_ALLOC_WITH_USAGE == 0
         /* With hardware bounds checks the interpreter does no software

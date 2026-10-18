@@ -89,6 +89,8 @@ is_thread_detached(WASMDebugControlThread *control_thread)
     return control_thread->status == DETACHED;
 }
 
+#define ACCEPT_RETRY_DELAY_US (100 * 1000)
+
 static void *
 control_thread_routine(void *arg)
 {
@@ -145,17 +147,48 @@ control_thread_routine(void *arg)
 
     /* outer infinite loop: try to connect with the debugger */
     while (true) {
+        WASMGDBServerAcceptResult accepted;
+
+        /* STOPPED is set and read under wait_lock, so teardown either
+         * lands before this check or sees accepting and wakes the
+         * accept. */
+        os_mutex_lock(&control_thread->wait_lock);
+        if (is_thread_stopped(control_thread)) {
+            os_mutex_unlock(&control_thread->wait_lock);
+            return NULL;
+        }
+        control_thread->accepting = true;
+        os_mutex_unlock(&control_thread->wait_lock);
+
         /* wait lldb client to connect */
-        if (!wasm_gdbserver_accept(control_thread->server)) {
-            /* A stopping control thread's accept fails by design:
-             * wasm_debug_control_thread_destroy closed the socket. */
-            if (!is_thread_stopped(control_thread)) {
-                LOG_ERROR("Failed while accepting debugger connection\n");
-            }
+        accepted = wasm_gdbserver_accept(control_thread->server);
+
+        os_mutex_lock(&control_thread->wait_lock);
+        control_thread->accepting = false;
+        /* A client that connects during teardown, or teardown's own
+         * wake-up connection, must not be served: the instance is going
+         * away. wasm_debug_control_thread_destroy closes the socket. */
+        if (is_thread_stopped(control_thread)) {
+            os_mutex_unlock(&control_thread->wait_lock);
+            return NULL;
+        }
+        if (accepted == GDB_ACCEPT_RETRY) {
+            LOG_VERBOSE("Accepting a debugger connection failed, retrying\n");
+            /* Running out of descriptors persists for a while: don't
+             * spin on it. Teardown signals stop_cond to end the wait. */
+            os_cond_reltimedwait(&control_thread->stop_cond,
+                                 &control_thread->wait_lock,
+                                 ACCEPT_RETRY_DELAY_US);
+            os_mutex_unlock(&control_thread->wait_lock);
+            continue;
+        }
+        if (accepted == GDB_ACCEPT_FAILED) {
+            os_mutex_unlock(&control_thread->wait_lock);
+            LOG_ERROR("Failed while accepting debugger connection\n");
             goto fail;
         }
-
         control_thread->status = RUNNING;
+        os_mutex_unlock(&control_thread->wait_lock);
         /* when reattached, send signal */
         wasm_cluster_send_signal_all(debug_inst->cluster, WAMR_SIG_SINGSTEP);
 
@@ -248,6 +281,10 @@ wasm_debug_control_thread_create(WASMDebugInstance *debug_instance, int32 port)
 
     if (os_mutex_init(&control_thread->wait_lock) != 0)
         goto fail;
+    if (os_cond_init(&control_thread->stop_cond) != 0) {
+        os_mutex_destroy(&control_thread->wait_lock);
+        goto fail;
+    }
 
     debug_instance->control_thread = control_thread;
 
@@ -281,6 +318,7 @@ wasm_debug_control_thread_create(WASMDebugInstance *debug_instance, int32 port)
     return control_thread;
 
 fail1:
+    os_cond_destroy(&control_thread->stop_cond);
     os_mutex_destroy(&control_thread->wait_lock);
 fail:
     wasm_runtime_free(control_thread);
@@ -291,16 +329,38 @@ static void
 wasm_debug_control_thread_destroy(WASMDebugInstance *debug_instance)
 {
     WASMDebugControlThread *control_thread = debug_instance->control_thread;
+    bool accepting;
 
     LOG_VERBOSE("stopping control thread of debug object [%p]\n",
                 debug_instance);
-    control_thread->status = STOPPED;
+    os_mutex_lock(&debug_instance->wait_lock);
+    control_thread->stop_requested = true;
+    os_cond_broadcast(&debug_instance->wait_cond);
+    os_mutex_unlock(&debug_instance->wait_lock);
+
     os_mutex_lock(&control_thread->wait_lock);
-    wasm_close_gdbserver(control_thread->server);
+    control_thread->status = STOPPED;
+    accepting = control_thread->accepting;
+    os_cond_signal(&control_thread->stop_cond);
     os_mutex_unlock(&control_thread->wait_lock);
+
+    /* The sockets stay open until the join: closing the listening
+     * socket under a thread about to accept on it had that thread
+     * accept on a freed handle (Windows) or a reused descriptor. A
+     * connection wakes the accept instead; the thread sees STOPPED
+     * and exits. A thread serving a client sees STOPPED within its
+     * one-second receive timeout. */
+    if (accepting
+        && !wasm_gdbserver_wake(control_thread->ip_addr,
+                                control_thread->port)) {
+        LOG_WARNING("Could not wake the debug server, closing it\n");
+        wasm_gdbserver_close_listener(control_thread->server);
+    }
     os_thread_join(control_thread->tid, NULL);
+    wasm_close_gdbserver(control_thread->server);
     wasm_runtime_free(control_thread->server);
 
+    os_cond_destroy(&control_thread->stop_cond);
     os_mutex_destroy(&control_thread->wait_lock);
     wasm_runtime_free(control_thread);
 }
@@ -1088,6 +1148,8 @@ wasm_debug_instance_watchpoint_read_remove(WASMDebugInstance *instance,
     return remove_watchpoint(&instance->watch_point_list_read, addr, length);
 }
 
+#define ON_FAILURE_LAUNCH_WAIT_US (1000 * 1000)
+
 bool
 wasm_debug_instance_on_failure(WASMDebugInstance *instance)
 {
@@ -1104,9 +1166,15 @@ wasm_debug_instance_on_failure(WASMDebugInstance *instance)
     }
 
     if (instance->stopped_thread == NULL
-        && instance->current_state == DBG_LAUNCHING) {
-        /* if fail in start stage: may need wait for main thread to notify it */
-        os_cond_wait(&instance->wait_cond, &instance->wait_lock);
+        && instance->current_state == DBG_LAUNCHING
+        && !instance->control_thread->stop_requested) {
+        /* if fail in start stage: may need wait for main thread to notify
+         * it. A detach also leaves DBG_LAUNCHING, and then the program
+         * runs on or has ended and nothing notifies, so the wait is
+         * bounded: unbounded, it hung the control thread and the join in
+         * wasm_debug_control_thread_destroy. */
+        os_cond_reltimedwait(&instance->wait_cond, &instance->wait_lock,
+                             ON_FAILURE_LAUNCH_WAIT_US);
     }
     instance->current_state = DBG_ERROR;
     instance->stopped_thread = NULL;

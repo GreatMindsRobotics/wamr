@@ -189,9 +189,14 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
                                  (struct sockaddr *)&addr_tmp, (int *)&len);
 
     if ((*sock)->raw.socket == INVALID_SOCKET) {
+        /* Kept for the caller, which tells passing errors from fatal
+         * ones by it: the free and the print may overwrite it. */
+        int err = WSAGetLastError();
+
         BH_FREE(*sock);
         *sock = NULL;
-        os_printf("socket accept failed with error %d\n", WSAGetLastError());
+        os_printf("socket accept failed with error %d\n", err);
+        WSASetLastError(err);
         return BHT_ERROR;
     }
 
@@ -288,10 +293,22 @@ int
 os_socket_connect(bh_socket_t socket, const char *addr, int port)
 {
     CHECK_VALID_SOCKET_HANDLE(socket);
+    struct sockaddr_in addr_in = { 0 };
 
-    errno = ENOSYS;
+    assert(addr);
 
-    return BHT_ERROR;
+    /* IPv4 only, like os_socket_bind and os_socket_create. */
+    addr_in.sin_addr.s_addr = inet_addr(addr);
+    addr_in.sin_port = htons((u_short)port);
+    addr_in.sin_family = AF_INET;
+
+    if (connect(socket->raw.socket, (struct sockaddr *)&addr_in,
+                sizeof(addr_in))
+        != 0) {
+        return BHT_ERROR;
+    }
+
+    return BHT_OK;
 }
 
 int

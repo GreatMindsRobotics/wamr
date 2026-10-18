@@ -23,9 +23,20 @@ typedef struct WASMDebugControlThread {
     WASMGDBServer *server;
     korp_tid tid;
     korp_mutex wait_lock;
+    /* Signalled when status becomes STOPPED, to end an accept retry's
+     * back-off early. */
+    korp_cond stop_cond;
     char ip_addr[128];
     int port;
     WASMDebugControlThreadStatus status;
+    /* Set, under wait_lock, while the thread is in or about to enter
+     * accept: teardown must then wake it before the join. */
+    bool accepting;
+    /* Set by teardown under the debug instance's wait_lock, before it
+     * takes this thread's: a packet handler waiting on the instance's
+     * wait_cond for a stop holds that lock, and stops when it sees
+     * this. */
+    bool stop_requested;
     struct WASMDebugEngine *debug_engine;
     struct WASMDebugInstance *debug_instance;
 } WASMDebugControlThread;

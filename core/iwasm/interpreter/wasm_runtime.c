@@ -2807,10 +2807,8 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
          * segments into that placeholder would overrun the 8-byte
          * buffer. Handler.c re-copies the segments into main's memory
          * after the swap (task #80) so semantics are preserved. */
-        {
-            extern bool g_clay_skip_side_linear_memory;
-            if (g_clay_skip_side_linear_memory)
-                continue;
+        if (wasm_clay_skipping_side_linear_memory()) {
+            continue;
         }
 
         /* has check it in loader */
