@@ -157,7 +157,7 @@ __wasi_errno_t
 os_fstat(os_file_handle handle, struct __wasi_filestat_t *buf)
 {
     struct zephyr_fs_desc *ptr = NULL;
-    int socktype, rc;
+    int rc;
 
     if (!handle->is_sock) {
 
@@ -196,6 +196,9 @@ os_fstat(os_file_handle handle, struct __wasi_filestat_t *buf)
         // return os_fstatat(handle, ptr->path, buf, 0);
     }
     else {
+#ifdef CONFIG_NET_SOCKETS
+        int socktype;
+
         // socklen_t socktypelen = sizeof(socktype);
         // rc = zsock_getsockopt(handle->fd, SOL_SOCKET, SO_TYPE, &socktype,
         // &socktypelen); Using `zsock_getsockopt` will add a dependency on the
@@ -223,6 +226,9 @@ os_fstat(os_file_handle handle, struct __wasi_filestat_t *buf)
         buf->st_mtim = 0;
         buf->st_ctim = 0;
         return __WASI_ESUCCESS;
+#else
+        return __WASI_ENOTSUP;
+#endif
     }
 }
 
@@ -546,9 +552,15 @@ os_close(os_file_handle handle, bool is_stdio)
     if (is_stdio)
         return __WASI_ESUCCESS;
 
+#ifdef CONFIG_NET_SOCKETS
     if (handle->is_sock) {
         rc = zsock_close(handle->fd);
     }
+#else
+    if (handle->is_sock) {
+        return __WASI_ENOTSUP;
+    }
+#endif
     // Handle is assumed to be a file descriptor
     else {
         GET_FILE_SYSTEM_DESCRIPTOR(handle->fd, ptr);
