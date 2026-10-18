@@ -2018,9 +2018,10 @@ wasm_memory_enlarge(WASMMemoryInstance *memory, uint64 inc_page_count)
 }
 
 /* The placeholder wasm_allocate_linear_memory hands out while
- * g_clay_skip_side_linear_memory is set. It is static, so freeing it
- * is a no-op: going through the munmap path, a heap placeholder leaked
- * on every platform whose os_munmap does not take heap pointers. */
+ * g_clay_skip_side_linear_memory is set, on builds that check bounds
+ * in software. It is static, so freeing it is a no-op: going through
+ * the munmap path, a heap placeholder leaked on every platform whose
+ * os_munmap does not take heap pointers. */
 static uint64 g_clay_side_memory_placeholder;
 
 void
@@ -2094,11 +2095,25 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
     bh_assert(memory_data_size);
 
     if (g_clay_skip_side_linear_memory) {
+        *memory_data_size = 0;
+#if defined(OS_ENABLE_HW_BOUND_CHECK) && WASM_MEM_ALLOC_WITH_USAGE == 0
+        /* With hardware bounds checks the interpreter does no software
+         * check, so a load or store goes straight to memory_data +
+         * address and only a fault stops it. A static placeholder has
+         * nothing behind it to fault on. Reserve the usual 8 GiB guard
+         * region instead, with nothing committed: every access traps
+         * "out of bounds memory access", as memory_data_size 0 does on
+         * software-checked builds, and no physical memory is used. */
+        *data = wasm_mmap_linear_memory(8 * (uint64)BH_GB, 0);
+        if (!*data) {
+            return BHT_ERROR;
+        }
+#else
         /* Shared by every side instance and never written: its data
          * segments are skipped, and memory_data_size 0 fails every
          * bounds check. */
         *data = (uint8 *)&g_clay_side_memory_placeholder;
-        *memory_data_size = 0;
+#endif
         return BHT_OK;
     }
 

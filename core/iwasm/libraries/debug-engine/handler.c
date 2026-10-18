@@ -928,7 +928,14 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
          * a 64 KiB alloc reliably fails after main is loaded. The
          * flag is cleared immediately after instantiate so main wasm
          * loads (the other call site of wasm_runtime_instantiate)
-         * keep getting real memory. */
+         * keep getting real memory.
+         *
+         * Multi-module also instantiates main again here, for the
+         * fragment's imports, so that sub-instance gets a
+         * placeholder too. The rebind below sends the fragment's
+         * calls to the paused main instance instead; anything that
+         * still runs in the sub-instance (main's start function)
+         * traps on its first memory access. */
         {
             extern bool g_clay_skip_side_linear_memory;
             g_clay_skip_side_linear_memory = true;
