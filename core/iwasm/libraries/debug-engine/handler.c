@@ -80,16 +80,25 @@ void
 handle_interrupt(WASMGDBServer *server)
 {
     WASMDebugInstance *debug_inst = server->thread->debug_instance;
+    bool stop_pending;
 
     /* An interrupt for a program that is not running has nothing to
      * stop. Sending WAMR_SIG_TRAP anyway leaves it pending on the
      * stopped thread, and the next continue stops at once. A stop that
      * is still being reported (stopped_thread set) is the same case.
      * current_state changes only on this thread, so it can be read
-     * without a lock. */
-    if (debug_inst == NULL || debug_inst->current_state != APP_RUNNING
-        || debug_inst->stopped_thread != NULL) {
+     * without a lock; execution threads set stopped_thread in
+     * on_thread_stop_event under wait_lock. A stop that lands just
+     * after this check still gets the interrupt, as it did before. */
+    if (debug_inst == NULL || debug_inst->current_state != APP_RUNNING) {
         LOG_VERBOSE("Ignore an interrupt: the program is not running");
+        return;
+    }
+    os_mutex_lock(&debug_inst->wait_lock);
+    stop_pending = debug_inst->stopped_thread != NULL;
+    os_mutex_unlock(&debug_inst->wait_lock);
+    if (stop_pending) {
+        LOG_VERBOSE("Ignore an interrupt: a stop is being reported");
         return;
     }
     wasm_debug_instance_interrupt_all_threads(debug_inst);
@@ -311,6 +320,7 @@ typedef struct WasmCallJob {
     uint32 argc;
     uint32 *argv;
     korp_mutex lock;
+    korp_cond cond;
     bool ok;
     bool done;
     bool aborted;
@@ -325,6 +335,7 @@ wasm_call_worker(void *arg)
     os_mutex_lock(&job->lock);
     job->ok = ok;
     job->done = true;
+    os_cond_signal(&job->cond);
     os_mutex_unlock(&job->lock);
     return NULL;
 }
@@ -340,11 +351,14 @@ wasm_call_job_done(WasmCallJob *job)
     return done;
 }
 
-/* The derived exec_env belongs to no cluster, so WAMR_SIG_TERM reaches
- * only the inferior call: the interpreter returns at its next suspend
- * check (taken branches, calls, returns) and the paused program never
- * sees it. A call blocked inside a host import aborts once the import
- * returns. A call that already finished is left alone. */
+/* The derived exec_env is in a cluster of its own, apart from the
+ * paused program's, so WAMR_SIG_TERM reaches only the inferior call:
+ * the interpreter returns at its next suspend check (taken branches,
+ * calls, returns) and the paused program never sees it. A call blocked
+ * inside a host import aborts once the import returns. A call that
+ * already finished is left alone, except in the short window between
+ * wasm_runtime_call_wasm returning and the worker marking it done,
+ * where the reply still says aborted. */
 static void
 wasm_call_job_abort(WasmCallJob *job)
 {
@@ -358,16 +372,6 @@ wasm_call_job_abort(WasmCallJob *job)
     os_mutex_unlock(&job->lock);
 }
 
-static void
-defer_byte(WASMGDBServer *server, char ch)
-{
-    if (server->deferred_len >= (int32)sizeof(server->deferred)) {
-        LOG_WARNING("qWasmCall: dropped a byte received during the call");
-        return;
-    }
-    server->deferred[server->deferred_len++] = ch;
-}
-
 /* Run the call on a worker thread and serve the link until it ends.
  * Returns false, having run nothing, when the worker cannot be
  * started. */
@@ -376,7 +380,7 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
 {
     korp_tid tid;
     char buf[256];
-    int32 n, i;
+    int32 n, i, room;
 
     job->ok = false;
     job->done = false;
@@ -384,16 +388,43 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
     if (os_mutex_init(&job->lock) != 0) {
         return false;
     }
+    if (os_cond_init(&job->cond) != 0) {
+        os_mutex_destroy(&job->lock);
+        return false;
+    }
     if (os_thread_create(&tid, wasm_call_worker, job,
                          APP_THREAD_STACK_SIZE_DEFAULT)
         != 0) {
+        os_cond_destroy(&job->cond);
         os_mutex_destroy(&job->lock);
         return false;
     }
 
     while (!wasm_call_job_done(job)) {
-        n = wasm_gdbserver_recv_raw(server, buf, (int32)sizeof(buf),
-                                    WASM_CALL_POLL_MS);
+        /* wasm_debug_control_thread_destroy sets STOPPED before it
+         * waits for this thread to drop the control thread's lock, so a
+         * runaway call with no \x03 coming would block teardown. */
+        if (server->thread->status == STOPPED) {
+            wasm_call_job_abort(job);
+            break;
+        }
+        /* Read no more than the deferred buffer can hold, so nothing
+         * is dropped; the rest waits in the transport. A \x03 needs no
+         * room, but it cannot be seen until the buffer drains. */
+        room = (int32)sizeof(server->deferred) - server->deferred_len;
+        if (room > (int32)sizeof(buf)) {
+            room = (int32)sizeof(buf);
+        }
+        if (room == 0) {
+            os_mutex_lock(&job->lock);
+            if (!job->done) {
+                os_cond_reltimedwait(&job->cond, &job->lock,
+                                     WASM_CALL_POLL_MS * 1000);
+            }
+            os_mutex_unlock(&job->lock);
+            continue;
+        }
+        n = wasm_gdbserver_recv_raw(server, buf, room, WASM_CALL_POLL_MS);
         if (n == -1) {
             continue;
         }
@@ -408,12 +439,13 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
                 wasm_call_job_abort(job);
             }
             else {
-                defer_byte(server, buf[i]);
+                server->deferred[server->deferred_len++] = buf[i];
             }
         }
     }
 
     os_thread_join(tid, NULL);
+    os_cond_destroy(&job->cond);
     os_mutex_destroy(&job->lock);
     return true;
 }
@@ -612,8 +644,8 @@ free_all_side_modules(bool modules_already_freed)
     }
 }
 
-/* Take the name off the module registered as the main one. It goes back
- * on the registry unnamed, as wasm_runtime_load left it, so the
+/* Take the name off the module registered as the main one. It stays on
+ * the registry unnamed, as wasm_runtime_load left it, so the
  * embedder's wasm_runtime_unload still frees it, and side modules
  * loaded for a later session no longer bind to it. A module the
  * registry no longer lists is left alone. */
@@ -624,12 +656,7 @@ forget_main_registration(void)
     if (g_main_registered != NULL
         && wasm_runtime_find_module_registered(SIDE_MAIN_REGISTRY_NAME)
                == g_main_registered) {
-        wasm_runtime_unregister_module(g_main_registered);
-        if (!wasm_runtime_register_module_internal(NULL, g_main_registered,
-                                                   NULL, 0, NULL, 0)) {
-            LOG_WARNING("qWasmLoadSide: could not keep the previous main "
-                        "module on the registry; it is not freed");
-        }
+        wasm_runtime_clear_registered_module_name(g_main_registered);
     }
 #endif
     g_main_registered = NULL;
