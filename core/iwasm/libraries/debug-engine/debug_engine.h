@@ -87,6 +87,8 @@ struct WASMDebugInstance {
      * RUNNING when receiving STEP/CONTINUE commands, and set to
      * STOPPED when any thread stopped */
     volatile debug_state_t current_state;
+    /* A client detached and none has connected since. */
+    bool detached;
     /* Execution memory info. During debugging, the debug client may request to
      * malloc a memory space to evaluate user expressions. We preserve a buffer
      * during creating debug instance, and use a simple bump pointer allocator
@@ -226,6 +228,10 @@ wasm_debug_instance_watchpoint_read_remove(WASMDebugInstance *instance,
 
 bool
 wasm_debug_instance_on_failure(WASMDebugInstance *instance);
+
+/* Whether teardown has begun, read under the instance's wait_lock. */
+bool
+wasm_debug_instance_stop_requested(WASMDebugInstance *instance);
 
 bool
 wasm_debug_instance_interrupt_all_threads(WASMDebugInstance *instance);

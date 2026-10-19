@@ -30,6 +30,13 @@ write_data_raw(WASMGDBServer *gdbserver, const uint8 *data, ssize_t len)
     }
     if (nwritten < 0) {
         LOG_ERROR("Write error\n");
+        if (t == NULL) {
+            /* A client that reset the connection is gone like one that
+             * closed it: the next receive detaches. Exiting killed the
+             * program with it. */
+            gdbserver->link_closed = true;
+            return;
+        }
         exit(-2);
     }
 }

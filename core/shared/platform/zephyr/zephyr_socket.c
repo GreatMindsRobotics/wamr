@@ -288,6 +288,7 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
 {
     *sock = BH_MALLOC(sizeof(zephyr_handle));
     if (!*sock) {
+        errno = ENOMEM;
         return BHT_ERROR;
     }
 

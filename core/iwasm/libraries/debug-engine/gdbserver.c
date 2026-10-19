@@ -133,22 +133,51 @@ wasm_gdbserver_listen(WASMGDBServer *server)
 }
 
 /* Errors after which a later accept can succeed. Anything else, such
- * as a closed or invalid listening socket, would fail again. */
+ * as a closed or invalid listening socket, would fail again. Linux
+ * also reports a pending network error of the new connection from
+ * accept, and accept(2) says to retry those. */
 static bool
 accept_error_is_transient(void)
 {
 #if defined(BH_PLATFORM_WINDOWS)
     int err = WSAGetLastError();
 
+    if (err == 0) {
+        /* Failed before reaching accept: the handle check or the
+         * handle's allocation. */
+        return errno == ENOMEM;
+    }
     return err == WSAECONNRESET || err == WSAEINTR || err == WSAEMFILE
-           || err == WSAENOBUFS;
+           || err == WSAENOBUFS || err == WSAENETDOWN;
 #else
-    return errno == EINTR || errno == ECONNABORTED || errno == EMFILE
-           || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM
+    switch (errno) {
+        case EINTR:
+        case ECONNABORTED:
+        case EMFILE:
+        case ENFILE:
+        case ENOBUFS:
+        case ENOMEM:
+        case EPERM:
+        case ENETDOWN:
+        case ENETUNREACH:
+        case EHOSTUNREACH:
+        case EOPNOTSUPP:
 #ifdef EPROTO
-           || errno == EPROTO
+        case EPROTO:
 #endif
-        ;
+#ifdef ENOPROTOOPT
+        case ENOPROTOOPT:
+#endif
+#ifdef EHOSTDOWN
+        case EHOSTDOWN:
+#endif
+#ifdef ENONET
+        case ENONET:
+#endif
+            return true;
+        default:
+            return false;
+    }
 #endif
 }
 

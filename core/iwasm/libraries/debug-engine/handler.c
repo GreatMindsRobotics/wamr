@@ -405,7 +405,8 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
         /* wasm_debug_control_thread_destroy sets stop_requested before
          * it waits for this thread to drop the control thread's lock, so
          * a runaway call with no \x03 coming would block teardown. */
-        if (server->thread->stop_requested) {
+        if (wasm_debug_instance_stop_requested(
+                (WASMDebugInstance *)server->thread->debug_instance)) {
             wasm_call_job_abort(job);
             break;
         }
@@ -726,6 +727,76 @@ ensure_main_registered(wasm_module_t main_module, char *err, size_t err_cap)
  *  - no-memory    : allocation failed
  *  - no-main-inst : couldn't resolve the paused module instance
  */
+/* wasm-ld makes __stack_pointer the first mutable i32 global the module
+ * defines. The loader records it only when the module exports
+ * __heap_base and __data_end, which a fragment does not. An imported
+ * global lives in its exporter's storage, so none qualifies. */
+static uint32
+stack_pointer_index(WASMModuleInstance *mi)
+{
+    uint32 index = mi->module->aux_stack_top_global_index;
+    uint32 i;
+
+    if (index != (uint32)-1) {
+        return index;
+    }
+    for (i = mi->module->import_global_count; i < mi->e->global_count; i++) {
+        if (mi->e->globals[i].type == VALUE_TYPE_I32
+            && mi->e->globals[i].is_mutable) {
+            return i;
+        }
+    }
+    return (uint32)-1;
+}
+
+/* The __stack_pointer values a qWasmCall saves and puts back after the
+ * call: creating its exec_env resets the called instance's to the
+ * initial stack top, and an aborted or trapping call never reaches the
+ * epilogues that would raise it again. One for the called instance, one
+ * for main when the call goes to a side module (the fragment calls
+ * main's functions). */
+typedef struct SavedStackPointers {
+    uint32 *addr[2];
+    uint32 value[2];
+    uint32 count;
+} SavedStackPointers;
+
+static void
+save_stack_pointer(SavedStackPointers *saved, wasm_module_inst_t inst)
+{
+    WASMModuleInstance *mi = (WASMModuleInstance *)inst;
+    uint32 *addr;
+    uint32 index;
+    uint32 i;
+
+    if (!inst || saved->count >= 2) {
+        return;
+    }
+    index = stack_pointer_index(mi);
+    if (index == (uint32)-1 || index >= mi->e->global_count) {
+        return;
+    }
+    addr = (uint32 *)(mi->global_data + mi->e->globals[index].data_offset);
+    for (i = 0; i < saved->count; i++) {
+        if (saved->addr[i] == addr) {
+            return;
+        }
+    }
+    saved->addr[saved->count] = addr;
+    saved->value[saved->count] = *addr;
+    saved->count++;
+}
+
+static void
+restore_stack_pointers(const SavedStackPointers *saved)
+{
+    uint32 i;
+
+    for (i = 0; i < saved->count; i++) {
+        *saved->addr[i] = saved->value[i];
+    }
+}
+
 void
 process_wasm_load_side(WASMGDBServer *server, char *args)
 {
@@ -1020,19 +1091,16 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
                  * reserved [16384, 24576) gap (8 KiB stack region
                  * above main's stack).
                  *
-                 * wasm-ld convention: the first mutable i32 global
-                 * is __stack_pointer. The fragment side module
-                 * produced by FragmentCompiler has exactly one
-                 * mutable global (verified via wasm-objdump). */
+                 * The fragment side module produced by FragmentCompiler
+                 * has exactly one mutable global (verified via
+                 * wasm-objdump); see stack_pointer_index. */
                 if (side_real->e && side_real->e->globals) {
-                    for (uint32 gi = 0; gi < side_real->e->global_count; gi++) {
+                    uint32 gi = stack_pointer_index(side_real);
+                    if (gi != (uint32)-1) {
                         WASMGlobalInstance *g = &side_real->e->globals[gi];
-                        if (g->type == VALUE_TYPE_I32 && g->is_mutable) {
-                            g->initial_value.i32 = 24576;
-                            *(uint32 *)(side_real->global_data
-                                        + g->data_offset) = 24576;
-                            break;
-                        }
+                        g->initial_value.i32 = 24576;
+                        *(uint32 *)(side_real->global_data + g->data_offset) =
+                            24576;
                     }
                 }
             }
@@ -1116,74 +1184,6 @@ process_wasm_unload_side(WASMGDBServer *server, char *args)
     snprintf(tmpbuf, MAX_PACKET_SIZE, "OK");
     write_packet(server, tmpbuf);
     os_mutex_unlock(&tmpbuf_lock);
-}
-
-/* The __stack_pointer values a qWasmCall saves, to put back when the
- * call aborts or traps: its frames never reach the epilogues that would
- * raise them again. One for the called instance, one for main when the
- * call goes to a side module (the fragment calls main's functions). */
-typedef struct SavedStackPointers {
-    uint32 *addr[2];
-    uint32 value[2];
-    uint32 count;
-} SavedStackPointers;
-
-/* wasm-ld makes __stack_pointer the first mutable i32 global. The
- * loader only records it when the module exports __heap_base and
- * __data_end, which a fragment does not. */
-static uint32 *
-stack_pointer_addr(wasm_module_inst_t inst)
-{
-    WASMModuleInstance *mi = (WASMModuleInstance *)inst;
-    uint32 index = mi->module->aux_stack_top_global_index;
-    uint32 i;
-
-    if (index == (uint32)-1) {
-        for (i = 0; i < mi->e->global_count; i++) {
-            if (mi->e->globals[i].type == VALUE_TYPE_I32
-                && mi->e->globals[i].is_mutable) {
-                index = i;
-                break;
-            }
-        }
-    }
-    if (index == (uint32)-1 || index >= mi->e->global_count) {
-        return NULL;
-    }
-    return (uint32 *)(mi->global_data + mi->e->globals[index].data_offset);
-}
-
-static void
-save_stack_pointer(SavedStackPointers *saved, wasm_module_inst_t inst)
-{
-    uint32 *addr;
-    uint32 i;
-
-    if (!inst || saved->count >= 2) {
-        return;
-    }
-    addr = stack_pointer_addr(inst);
-    if (!addr) {
-        return;
-    }
-    for (i = 0; i < saved->count; i++) {
-        if (saved->addr[i] == addr) {
-            return;
-        }
-    }
-    saved->addr[saved->count] = addr;
-    saved->value[saved->count] = *addr;
-    saved->count++;
-}
-
-static void
-restore_stack_pointers(const SavedStackPointers *saved)
-{
-    uint32 i;
-
-    for (i = 0; i < saved->count; i++) {
-        *saved->addr[i] = saved->value[i];
-    }
 }
 
 void
@@ -1361,18 +1361,6 @@ process_wasm_call(WASMGDBServer *server, char *args)
      * cannot disturb the paused frame. The 64 KiB is why an embedded
      * target needs pool headroom beyond the running program: see
      * Brick/working_with_nucleo_h7a3.md. */
-    call_env = wasm_runtime_create_exec_env(module_inst, 64 * 1024);
-    if (!call_env) {
-        emit_err_reply(server, "no-env", "wasm_runtime_create_exec_env failed");
-        os_mutex_unlock(&tmpbuf_lock);
-        return;
-    }
-
-    /* Clear any prior exception on the module instance so we can
-     * distinguish "this call trapped" from "an earlier call left
-     * an exception lying around". */
-    wasm_runtime_set_exception(module_inst, NULL);
-
     memset(&saved_sp, 0, sizeof(saved_sp));
     save_stack_pointer(&saved_sp, module_inst);
     if (side) {
@@ -1383,6 +1371,22 @@ process_wasm_call(WASMGDBServer *server, char *args)
                                wasm_runtime_get_module_inst(paused_env));
         }
     }
+
+    call_env = wasm_runtime_create_exec_env(module_inst, 64 * 1024);
+    /* Its new cluster reset the instance's __stack_pointer to the
+     * initial stack top, over the paused program's live frames. Put it
+     * back so the call nests below them. */
+    restore_stack_pointers(&saved_sp);
+    if (!call_env) {
+        emit_err_reply(server, "no-env", "wasm_runtime_create_exec_env failed");
+        os_mutex_unlock(&tmpbuf_lock);
+        return;
+    }
+
+    /* Clear any prior exception on the module instance so we can
+     * distinguish "this call trapped" from "an earlier call left
+     * an exception lying around". */
+    wasm_runtime_set_exception(module_inst, NULL);
 
     /* Part B2: install per-call stdout capture so wasi fd_write
      * during the inferior call routes into our buffer instead of
@@ -1401,6 +1405,7 @@ process_wasm_call(WASMGDBServer *server, char *args)
     else {
         ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
     }
+    restore_stack_pointers(&saved_sp);
 
     {
         const char *captured_stdout = NULL;
@@ -1425,7 +1430,6 @@ process_wasm_call(WASMGDBServer *server, char *args)
             snprintf(tmpbuf, MAX_PACKET_SIZE, "ERR:aborted:%s:%s", msg_hex,
                      stdout_hex);
             write_packet(server, tmpbuf);
-            restore_stack_pointers(&saved_sp);
             wasm_runtime_set_exception(module_inst, NULL);
             wasm_runtime_destroy_exec_env(call_env);
             os_mutex_unlock(&tmpbuf_lock);
@@ -1446,7 +1450,6 @@ process_wasm_call(WASMGDBServer *server, char *args)
             snprintf(tmpbuf, MAX_PACKET_SIZE, "ERR:%s:%s:%s",
                      trap_code_from_exception(exc), exc_hex, stdout_hex);
             write_packet(server, tmpbuf);
-            restore_stack_pointers(&saved_sp);
             wasm_runtime_set_exception(module_inst, NULL);
             wasm_runtime_destroy_exec_env(call_env);
             os_mutex_unlock(&tmpbuf_lock);

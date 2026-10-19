@@ -90,6 +90,8 @@ is_thread_detached(WASMDebugControlThread *control_thread)
 }
 
 #define ACCEPT_RETRY_DELAY_US (100 * 1000)
+#define WAKE_ATTEMPTS 10
+#define WAKE_RETRY_DELAY_US (50 * 1000)
 
 static void *
 control_thread_routine(void *arg)
@@ -188,12 +190,19 @@ control_thread_routine(void *arg)
             goto fail;
         }
         control_thread->status = RUNNING;
+        debug_inst->detached = false;
         os_mutex_unlock(&control_thread->wait_lock);
         /* when reattached, send signal */
         wasm_cluster_send_signal_all(debug_inst->cluster, WAMR_SIG_SINGSTEP);
 
         /* inner infinite loop: keep serving until detach */
         while (true) {
+            /* Teardown sets STOPPED only once it holds wait_lock, which
+             * this loop retakes right after every receive: the mutex is
+             * not fair, so it might never get it. */
+            if (wasm_debug_instance_stop_requested(debug_inst)) {
+                return NULL;
+            }
             os_mutex_lock(&control_thread->wait_lock);
             if (is_thread_running(control_thread)) {
                 /* send thread stop reply */
@@ -348,13 +357,30 @@ wasm_debug_control_thread_destroy(WASMDebugInstance *debug_instance)
      * socket under a thread about to accept on it had that thread
      * accept on a freed handle (Windows) or a reused descriptor. A
      * connection wakes the accept instead; the thread sees STOPPED
-     * and exits. A thread serving a client sees STOPPED within its
-     * one-second receive timeout. */
-    if (accepting
-        && !wasm_gdbserver_wake(control_thread->ip_addr,
-                                control_thread->port)) {
-        LOG_WARNING("Could not wake the debug server, closing it\n");
-        wasm_gdbserver_close_listener(control_thread->server);
+     * and exits. A thread serving a client sees stop_requested. */
+    if (accepting) {
+        bool woke = false;
+        uint32 attempt;
+
+        /* A refused wake means the backlog is full, which the accept
+         * drains. */
+        for (attempt = 0; attempt < WAKE_ATTEMPTS && !woke; attempt++) {
+            woke = wasm_gdbserver_wake(control_thread->ip_addr,
+                                       control_thread->port);
+            if (!woke) {
+                os_mutex_lock(&control_thread->wait_lock);
+                os_cond_reltimedwait(&control_thread->stop_cond,
+                                     &control_thread->wait_lock,
+                                     WAKE_RETRY_DELAY_US);
+                os_mutex_unlock(&control_thread->wait_lock);
+            }
+        }
+        if (!woke) {
+            /* The last resort, with the race above: better than a join
+             * that never returns. */
+            LOG_WARNING("Could not wake the debug server, closing it\n");
+            wasm_gdbserver_close_listener(control_thread->server);
+        }
     }
     os_thread_join(control_thread->tid, NULL);
     wasm_close_gdbserver(control_thread->server);
@@ -1151,6 +1177,17 @@ wasm_debug_instance_watchpoint_read_remove(WASMDebugInstance *instance,
 #define ON_FAILURE_LAUNCH_WAIT_US (1000 * 1000)
 
 bool
+wasm_debug_instance_stop_requested(WASMDebugInstance *instance)
+{
+    bool stop;
+
+    os_mutex_lock(&instance->wait_lock);
+    stop = instance->control_thread->stop_requested;
+    os_mutex_unlock(&instance->wait_lock);
+    return stop;
+}
+
+bool
 wasm_debug_instance_on_failure(WASMDebugInstance *instance)
 {
     WASMExecEnv *exec_env;
@@ -1175,6 +1212,12 @@ wasm_debug_instance_on_failure(WASMDebugInstance *instance)
          * wasm_debug_control_thread_destroy. */
         os_cond_reltimedwait(&instance->wait_cond, &instance->wait_lock,
                              ON_FAILURE_LAUNCH_WAIT_US);
+    }
+    /* After a detach no debugger holds the program, which runs on or
+     * has ended: losing the debug server is no reason to kill it. */
+    if (instance->detached && instance->current_state == DBG_LAUNCHING) {
+        os_mutex_unlock(&instance->wait_lock);
+        return true;
     }
     instance->current_state = DBG_ERROR;
     instance->stopped_thread = NULL;
@@ -1265,6 +1308,7 @@ wasm_debug_instance_detach(WASMDebugInstance *instance)
     /* relaunch, accept new debug connection */
     instance->current_state = DBG_LAUNCHING;
     instance->control_thread->status = DETACHED;
+    instance->detached = true;
     instance->stopped_thread = NULL;
 
     return true;

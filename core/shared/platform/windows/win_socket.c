@@ -175,6 +175,9 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
     struct sockaddr addr_tmp;
     unsigned int len = sizeof(struct sockaddr);
 
+    /* A failure before accept leaves no stale code for the caller to
+     * classify. */
+    WSASetLastError(0);
     *sock = BH_MALLOC(sizeof(windows_handle));
 
     if (*sock == NULL) {
