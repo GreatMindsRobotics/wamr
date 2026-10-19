@@ -132,7 +132,68 @@ wasm_gdbserver_listen(WASMGDBServer *server)
     return true;
 }
 
-bool
+/* Errors after which a later accept can succeed. Anything else, such
+ * as a closed or invalid listening socket, would fail again. Linux
+ * also reports a pending network error of the new connection from
+ * accept, and accept(2) says to retry those. */
+static bool
+accept_error_is_transient(void)
+{
+#if defined(BH_PLATFORM_WINDOWS)
+    int err = WSAGetLastError();
+
+    if (err == 0) {
+        /* Failed before reaching accept: the handle check or the
+         * handle's allocation. */
+        return errno == ENOMEM;
+    }
+    return err == WSAECONNRESET || err == WSAEINTR || err == WSAEMFILE
+           || err == WSAENOBUFS || err == WSAENETDOWN;
+#else
+    switch (errno) {
+        case EINTR:
+        case ECONNABORTED:
+        case EMFILE:
+        case ENFILE:
+        case ENOBUFS:
+        case ENOMEM:
+        case EPERM:
+        case ENETDOWN:
+        case ENETUNREACH:
+        case EHOSTUNREACH:
+        case EOPNOTSUPP:
+#ifdef EPROTO
+        case EPROTO:
+#endif
+#ifdef ENOPROTOOPT
+        case ENOPROTOOPT:
+#endif
+#ifdef EHOSTDOWN
+        case EHOSTDOWN:
+#endif
+#ifdef ENONET
+        case ENONET:
+#endif
+            return true;
+        default:
+            return false;
+    }
+#endif
+}
+
+static bool
+recv_error_is_disconnect(void)
+{
+#if defined(BH_PLATFORM_WINDOWS)
+    int err = WSAGetLastError();
+
+    return err == WSAECONNRESET || err == WSAECONNABORTED;
+#else
+    return errno == ECONNRESET || errno == ECONNABORTED;
+#endif
+}
+
+WASMGDBServerAcceptResult
 wasm_gdbserver_accept(WASMGDBServer *server)
 {
 
@@ -146,31 +207,53 @@ wasm_gdbserver_accept(WASMGDBServer *server)
     if (t != NULL) {
         if (t->accept && !t->accept(t->ctx)) {
             LOG_ERROR("wasm gdb server error: transport accept failed");
-            return false;
+            return GDB_ACCEPT_FAILED;
         }
         server->socket_fd = (bh_socket_t)-1;
         server->noack = false;
-        return true;
+        return GDB_ACCEPT_OK;
     }
 
     LOG_VERBOSE("waiting for gdb client to connect...");
 
     /* The result, not sockt_fd, says whether accept failed: on Windows
-     * bh_socket_t is a pointer, never < 0, and a failed accept leaves it
-     * pointing at the handle it just freed. A failed accept also leaves
-     * listen_fd alone. It fails when wasm_close_gdbserver closes the
-     * listening socket under it, which frees that handle on Windows,
-     * and wasm_close_gdbserver closes listen_fd in every other case. */
+     * bh_socket_t is a pointer, never < 0. A failed accept leaves
+     * listen_fd alone; wasm_close_gdbserver closes it. */
     if (os_socket_accept(server->listen_fd, &sockt_fd, NULL, NULL)
         != BHT_OK) {
-        return false;
+        if (accept_error_is_transient()) {
+            return GDB_ACCEPT_RETRY;
+        }
+        return GDB_ACCEPT_FAILED;
     }
 
     LOG_VERBOSE("accept gdb client");
     server->socket_fd = sockt_fd;
     server->noack = false;
     server->link_closed = false;
-    return true;
+    return GDB_ACCEPT_OK;
+}
+
+bool
+wasm_gdbserver_wake(const char *host, int port)
+{
+    bh_socket_t fd = (bh_socket_t)-1;
+    bool connected;
+
+    if (wasm_gdbserver_get_transport() != NULL) {
+        return true;
+    }
+    /* A server bound to every interface is reachable on loopback, and
+     * connecting to 0.0.0.0 itself fails on Windows. */
+    if (!strcmp(host, "0.0.0.0")) {
+        host = "127.0.0.1";
+    }
+    if (os_socket_create(&fd, true, true) != BHT_OK) {
+        return false;
+    }
+    connected = os_socket_connect(fd, host, port) == BHT_OK;
+    os_socket_close(fd);
+    return connected;
 }
 
 void
@@ -201,10 +284,21 @@ wasm_close_gdbserver(WASMGDBServer *server)
     if (socket_is_open(server->socket_fd)) {
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
+        server->socket_fd = (bh_socket_t)-1;
+    }
+    wasm_gdbserver_close_listener(server);
+}
+
+void
+wasm_gdbserver_close_listener(WASMGDBServer *server)
+{
+    if (wasm_gdbserver_get_transport() != NULL) {
+        return;
     }
     if (socket_is_open(server->listen_fd)) {
         os_socket_shutdown(server->listen_fd);
         os_socket_close(server->listen_fd);
+        server->listen_fd = (bh_socket_t)-1;
     }
 }
 
@@ -400,7 +494,9 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
 
     n = os_socket_recv(server->socket_fd, buf, sizeof(buf));
 
-    if (n == 0) {
+    /* A reset is the client going away too, just not cleanly: as a
+     * failure it ended the debug server and killed the program. */
+    if (n == 0 || (n < 0 && recv_error_is_disconnect())) {
         handle_detach_request(server, NULL);
         LOG_VERBOSE("Debugger disconnected, waiting for debugger reconnection");
         return true;

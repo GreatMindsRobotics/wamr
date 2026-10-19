@@ -10,6 +10,7 @@
 #include "utils.h"
 #include "wasm_runtime.h"
 #include "wasm_export.h"
+#include "../../common/wasm_memory.h"
 
 #if defined(BH_PLATFORM_WINDOWS)
 /* `getcwd` lives in `<direct.h>` as `_getcwd` on the Windows CRT. */
@@ -401,10 +402,11 @@ run_call_interruptible(WASMGDBServer *server, WasmCallJob *job)
     }
 
     while (!wasm_call_job_done(job)) {
-        /* wasm_debug_control_thread_destroy sets STOPPED before it
-         * waits for this thread to drop the control thread's lock, so a
-         * runaway call with no \x03 coming would block teardown. */
-        if (server->thread->status == STOPPED) {
+        /* wasm_debug_control_thread_destroy sets stop_requested before
+         * it waits for this thread to drop the control thread's lock, so
+         * a runaway call with no \x03 coming would block teardown. */
+        if (wasm_debug_instance_stop_requested(
+                (WASMDebugInstance *)server->thread->debug_instance)) {
             wasm_call_job_abort(job);
             break;
         }
@@ -725,6 +727,76 @@ ensure_main_registered(wasm_module_t main_module, char *err, size_t err_cap)
  *  - no-memory    : allocation failed
  *  - no-main-inst : couldn't resolve the paused module instance
  */
+/* wasm-ld makes __stack_pointer the first mutable i32 global the module
+ * defines. The loader records it only when the module exports
+ * __heap_base and __data_end, which a fragment does not. An imported
+ * global lives in its exporter's storage, so none qualifies. */
+static uint32
+stack_pointer_index(WASMModuleInstance *mi)
+{
+    uint32 index = mi->module->aux_stack_top_global_index;
+    uint32 i;
+
+    if (index != (uint32)-1) {
+        return index;
+    }
+    for (i = mi->module->import_global_count; i < mi->e->global_count; i++) {
+        if (mi->e->globals[i].type == VALUE_TYPE_I32
+            && mi->e->globals[i].is_mutable) {
+            return i;
+        }
+    }
+    return (uint32)-1;
+}
+
+/* The __stack_pointer values a qWasmCall saves and puts back after the
+ * call: creating its exec_env resets the called instance's to the
+ * initial stack top, and an aborted or trapping call never reaches the
+ * epilogues that would raise it again. One for the called instance, one
+ * for main when the call goes to a side module (the fragment calls
+ * main's functions). */
+typedef struct SavedStackPointers {
+    uint32 *addr[2];
+    uint32 value[2];
+    uint32 count;
+} SavedStackPointers;
+
+static void
+save_stack_pointer(SavedStackPointers *saved, wasm_module_inst_t inst)
+{
+    WASMModuleInstance *mi = (WASMModuleInstance *)inst;
+    uint32 *addr;
+    uint32 index;
+    uint32 i;
+
+    if (!inst || saved->count >= 2) {
+        return;
+    }
+    index = stack_pointer_index(mi);
+    if (index == (uint32)-1 || index >= mi->e->global_count) {
+        return;
+    }
+    addr = (uint32 *)(mi->global_data + mi->e->globals[index].data_offset);
+    for (i = 0; i < saved->count; i++) {
+        if (saved->addr[i] == addr) {
+            return;
+        }
+    }
+    saved->addr[saved->count] = addr;
+    saved->value[saved->count] = *addr;
+    saved->count++;
+}
+
+static void
+restore_stack_pointers(const SavedStackPointers *saved)
+{
+    uint32 i;
+
+    for (i = 0; i < saved->count; i++) {
+        *saved->addr[i] = saved->value[i];
+    }
+}
+
 void
 process_wasm_load_side(WASMGDBServer *server, char *args)
 {
@@ -937,15 +1009,12 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
          * calls to the paused main instance instead; anything that
          * still runs in the sub-instance (main's start function)
          * traps on its first memory access. */
-        {
-            extern bool g_clay_skip_side_linear_memory;
-            g_clay_skip_side_linear_memory = true;
-            side_inst = wasm_runtime_instantiate(
-                side_module,
-                /*default_stack_size=*/8 * 1024,
-                /*host_managed_heap_size=*/0, err, sizeof(err));
-            g_clay_skip_side_linear_memory = false;
-        }
+        wasm_clay_skip_side_linear_memory(true);
+        side_inst = wasm_runtime_instantiate(side_module,
+                                             /*default_stack_size=*/8 * 1024,
+                                             /*host_managed_heap_size=*/0, err,
+                                             sizeof(err));
+        wasm_clay_skip_side_linear_memory(false);
         if (!side_inst) {
             emit_err_reply(server, "link-error",
                            err[0] ? err : "instantiate failed");
@@ -1022,19 +1091,16 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
                  * reserved [16384, 24576) gap (8 KiB stack region
                  * above main's stack).
                  *
-                 * wasm-ld convention: the first mutable i32 global
-                 * is __stack_pointer. The fragment side module
-                 * produced by FragmentCompiler has exactly one
-                 * mutable global (verified via wasm-objdump). */
+                 * The fragment side module produced by FragmentCompiler
+                 * has exactly one mutable global (verified via
+                 * wasm-objdump); see stack_pointer_index. */
                 if (side_real->e && side_real->e->globals) {
-                    for (uint32 gi = 0; gi < side_real->e->global_count; gi++) {
+                    uint32 gi = stack_pointer_index(side_real);
+                    if (gi != (uint32)-1) {
                         WASMGlobalInstance *g = &side_real->e->globals[gi];
-                        if (g->type == VALUE_TYPE_I32 && g->is_mutable) {
-                            g->initial_value.i32 = 24576;
-                            *(uint32 *)(side_real->global_data
-                                        + g->data_offset) = 24576;
-                            break;
-                        }
+                        g->initial_value.i32 = 24576;
+                        *(uint32 *)(side_real->global_data + g->data_offset) =
+                            24576;
                     }
                 }
             }
@@ -1149,6 +1215,7 @@ process_wasm_call(WASMGDBServer *server, char *args)
     bool aborted = false;
     uint32 side_handle = 0;
     WasmSideModule *side = NULL;
+    SavedStackPointers saved_sp;
 
     /* Two forms (subplan #4 Parts A and G):
      *   1-segment-pair: qWasmCall:<funcname-hex>:<argbytes-hex>
@@ -1294,7 +1361,22 @@ process_wasm_call(WASMGDBServer *server, char *args)
      * cannot disturb the paused frame. The 64 KiB is why an embedded
      * target needs pool headroom beyond the running program: see
      * Brick/working_with_nucleo_h7a3.md. */
+    memset(&saved_sp, 0, sizeof(saved_sp));
+    save_stack_pointer(&saved_sp, module_inst);
+    if (side) {
+        paused_env = wasm_debug_instance_get_current_env(
+            (WASMDebugInstance *)server->thread->debug_instance);
+        if (paused_env) {
+            save_stack_pointer(&saved_sp,
+                               wasm_runtime_get_module_inst(paused_env));
+        }
+    }
+
     call_env = wasm_runtime_create_exec_env(module_inst, 64 * 1024);
+    /* Its new cluster reset the instance's __stack_pointer to the
+     * initial stack top, over the paused program's live frames. Put it
+     * back so the call nests below them. */
+    restore_stack_pointers(&saved_sp);
     if (!call_env) {
         emit_err_reply(server, "no-env", "wasm_runtime_create_exec_env failed");
         os_mutex_unlock(&tmpbuf_lock);
@@ -1323,6 +1405,7 @@ process_wasm_call(WASMGDBServer *server, char *args)
     else {
         ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
     }
+    restore_stack_pointers(&saved_sp);
 
     {
         const char *captured_stdout = NULL;
@@ -1811,10 +1894,17 @@ handle_threadstop_request(WASMGDBServer *server, char *payload)
        reason the target halted */
     bh_assert(debug_inst->current_state == DBG_LAUNCHING);
 
-    /* Waiting for the stop event */
+    /* Waiting for the stop event. None comes once the program has
+     * ended, and the wait holds the control thread's lock, so teardown
+     * ends it (see wasm_debug_control_thread_destroy). */
     os_mutex_lock(&debug_inst->wait_lock);
-    while (!debug_inst->stopped_thread) {
+    while (!debug_inst->stopped_thread
+           && !server->thread->stop_requested) {
         os_cond_wait(&debug_inst->wait_cond, &debug_inst->wait_lock);
+    }
+    if (!debug_inst->stopped_thread) {
+        os_mutex_unlock(&debug_inst->wait_lock);
+        return;
     }
     os_mutex_unlock(&debug_inst->wait_lock);
 

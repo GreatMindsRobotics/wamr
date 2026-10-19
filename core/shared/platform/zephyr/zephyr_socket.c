@@ -206,8 +206,11 @@ os_socket_create(bh_socket_t *sock, bool is_ipv4, bool is_tcp)
 
     (*sock)->is_sock = true;
 
+    /* Cleared like the Windows layer does, so that a caller holding
+     * the handle cannot close the freed one. */
     if ((*sock)->fd == -1) {
         BH_FREE(*sock);
+        *sock = NULL;
         return BHT_ERROR;
     }
 
@@ -285,6 +288,7 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
 {
     *sock = BH_MALLOC(sizeof(zephyr_handle));
     if (!*sock) {
+        errno = ENOMEM;
         return BHT_ERROR;
     }
 
@@ -292,6 +296,7 @@ os_socket_accept(bh_socket_t server_sock, bh_socket_t *sock, void *addr,
 
     if ((*sock)->fd < 0) {
         BH_FREE(*sock);
+        *sock = NULL;
         return BHT_ERROR;
     }
 

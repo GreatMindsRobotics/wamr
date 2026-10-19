@@ -83,14 +83,31 @@ wasm_create_gdbserver(const char *host, int *port);
 bool
 wasm_gdbserver_listen(WASMGDBServer *server);
 
-bool
+typedef enum WASMGDBServerAcceptResult {
+    GDB_ACCEPT_OK,
+    /* The error passes (an aborted connection, a signal, running out of
+     * descriptors for now): accept again. */
+    GDB_ACCEPT_RETRY,
+    GDB_ACCEPT_FAILED,
+} WASMGDBServerAcceptResult;
+
+WASMGDBServerAcceptResult
 wasm_gdbserver_accept(WASMGDBServer *server);
+
+/* Connect to the server listening on host:port and hang up, so that an
+ * accept blocked on it returns. False if the connection failed. */
+bool
+wasm_gdbserver_wake(const char *host, int port);
 
 void
 wasm_gdbserver_detach(WASMGDBServer *server);
 
 void
 wasm_close_gdbserver(WASMGDBServer *server);
+
+/* Close only the listening socket, which makes a blocked accept fail. */
+void
+wasm_gdbserver_close_listener(WASMGDBServer *server);
 
 bool
 wasm_gdbserver_handle_packet(WASMGDBServer *server);
