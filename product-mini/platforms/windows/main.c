@@ -710,6 +710,13 @@ main(int argc, char *argv[])
             printf("Failed to start debug instance\n");
             goto fail4;
         }
+        /* The port the debug server bound, so a launcher that passed
+         * port 0 can connect without picking a port itself. stderr, and
+         * flushed: stdout is block-buffered when it is a pipe, which
+         * would hold this line until exit. */
+        fprintf(stderr, "Debug server listening on %s:%" PRIu32 "\n", ip_addr,
+                debug_port);
+        fflush(stderr);
     }
 #endif
 
