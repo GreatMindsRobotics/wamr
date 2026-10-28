@@ -148,10 +148,16 @@ control_thread_routine(void *arg)
         /* wait lldb client to connect */
         if (!wasm_gdbserver_accept(control_thread->server)) {
             /* A stopping control thread's accept fails by design:
-             * wasm_debug_control_thread_destroy closed the socket. */
-            if (!is_thread_stopped(control_thread)) {
-                LOG_ERROR("Failed while accepting debugger connection\n");
+             * wasm_debug_control_thread_destroy closed the socket, and
+             * its caller is tearing the instance down, so there is no
+             * failure to handle. wasm_debug_instance_on_failure would
+             * wait for a launch stop that never comes when a debugger
+             * has detached: the detach resumed every thread, so the
+             * destroy's join would never return. */
+            if (is_thread_stopped(control_thread)) {
+                return NULL;
             }
+            LOG_ERROR("Failed while accepting debugger connection\n");
             goto fail;
         }
 
