@@ -29,6 +29,14 @@ write_data_raw(WASMGDBServer *gdbserver, const uint8 *data, ssize_t len)
         nwritten = os_socket_send(gdbserver->socket_fd, data, len);
     }
     if (nwritten < 0) {
+        if (t == NULL) {
+            /* The debugger has gone. The embedder outlives it, so the
+             * link is marked closed and the control thread ends the
+             * session on its next recv, as for any other disconnect. */
+            LOG_ERROR("Write error, the debugger link is closed\n");
+            gdbserver->link_closed = true;
+            return;
+        }
         LOG_ERROR("Write error\n");
         exit(-2);
     }
