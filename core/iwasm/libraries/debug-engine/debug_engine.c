@@ -1256,13 +1256,19 @@ wasm_debug_instance_kill(WASMDebugInstance *instance)
 
     while (exec_env) {
         wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_TERM);
-        if (instance->current_state == APP_STOPPED) {
-            /* Resume all threads so they can receive the TERM signal */
-            os_mutex_lock(&exec_env->wait_lock);
+        /* Resume every halted thread so it can receive the TERM signal.
+         * A thread can be halted before the debugger has been told of the
+         * stop: the halt that follows an accept waits for the debugger's
+         * "?" while the instance is still DBG_LAUNCHING. A debugger lost
+         * before it asks is such a case, and its kill must still end the
+         * program. */
+        os_mutex_lock(&exec_env->wait_lock);
+        if (instance->current_state == APP_STOPPED
+            || exec_env->current_status->running_status == STATUS_STOP) {
             exec_env->current_status->running_status = STATUS_RUNNING;
             os_cond_signal(&exec_env->wait_cond);
-            os_mutex_unlock(&exec_env->wait_lock);
         }
+        os_mutex_unlock(&exec_env->wait_lock);
         exec_env = bh_list_elem_next(exec_env);
     }
 
