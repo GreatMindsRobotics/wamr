@@ -981,17 +981,16 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
                  * data segments and memcpy each into main's memory
                  * at its wasm-declared offset.
                  *
-                 * Layout contract (FragmentCompiler + HostWasmBuilder):
-                 *   - Fragment is linked `--stack-first
-                 *     --global-base=24576` → fragment stack at
-                 *     [16384, 24576), data segments at offsets
-                 *     >= 24576.
-                 *   - Main is linked `--global-base=32768`,
-                 *     -z,stack-size=16384 → main's wasm stack at
-                 *     [0, 16384), data at >= 32768. Region
-                 *     [16384, 32768) is reserved for fragment use.
-                 *   Fragment's data lands in main's reserved window
-                 *   [24576, 32768) with no collision. */
+                 * Layout contract (the WAMR program profile in
+                 * OpenBrick's Clay/runtime/clay_runtime.h, which
+                 * Sculptor's main build and FragmentCompiler both
+                 * follow): main's shadow stack sits at the bottom of
+                 * its memory and its data above a window reserved for
+                 * fragments. A fragment is linked --stack-first with
+                 * its stack top and its data both placed in that
+                 * window, so its data lands there with no collision
+                 * and its __stack_pointer starts in the window as
+                 * linked. */
                 WASMModule *side_mod = side_real->module;
                 WASMMemoryInstance *main_mem = main_real->memories[0];
                 if (side_mod && main_mem && main_mem->memory_data) {
@@ -1008,32 +1007,6 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
                         uint32 len = seg->data_length;
                         if ((uint64)off + len <= main_size) {
                             memcpy(main_mem->memory_data + off, seg->data, len);
-                        }
-                    }
-                }
-
-                /* Task #84: patch fragment's __stack_pointer.
-                 * wasm-ld initializes __sp to the stack-size value
-                 * (with --stack-first), placing fragment's stack at
-                 * [0, stack-size) — SAME region as main's own wasm
-                 * stack at [0, 16384), which collides catastrophically
-                 * once the memory pointer is shared. Patch __sp to
-                 * 24576 so fragment's stack writes land in main's
-                 * reserved [16384, 24576) gap (8 KiB stack region
-                 * above main's stack).
-                 *
-                 * wasm-ld convention: the first mutable i32 global
-                 * is __stack_pointer. The fragment side module
-                 * produced by FragmentCompiler has exactly one
-                 * mutable global (verified via wasm-objdump). */
-                if (side_real->e && side_real->e->globals) {
-                    for (uint32 gi = 0; gi < side_real->e->global_count; gi++) {
-                        WASMGlobalInstance *g = &side_real->e->globals[gi];
-                        if (g->type == VALUE_TYPE_I32 && g->is_mutable) {
-                            g->initial_value.i32 = 24576;
-                            *(uint32 *)(side_real->global_data
-                                        + g->data_offset) = 24576;
-                            break;
                         }
                     }
                 }

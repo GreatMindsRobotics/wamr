@@ -567,9 +567,14 @@ unless used elsewhere */
 #endif
 #define BLOCK_ADDR_CONFLICT_SIZE 2
 
-/* Default max thread num per cluster. Can be overwrite by
-    wasm_runtime_set_max_thread_num */
+/* Default max thread num per cluster, not counting the cluster's main
+    thread. Can be overwritten at build time (WAMR_BUILD_CLUSTER_MAX_THREAD_NUM)
+    or at run time by wasm_runtime_set_max_thread_num. Each slot takes an
+    equal share of the module's auxiliary stack, so 0 gives the main thread
+    all of it and allows no spawned threads. */
+#ifndef CLUSTER_MAX_THREAD_NUM
 #define CLUSTER_MAX_THREAD_NUM 4
+#endif
 
 #ifndef WASM_ENABLE_TAIL_CALL
 #define WASM_ENABLE_TAIL_CALL 0
