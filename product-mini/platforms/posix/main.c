@@ -28,50 +28,11 @@ static int app_argc;
 static char **app_argv;
 
 #ifdef CLAY_MOCK_NATIVES
-/* Clay panic hook (used by Option 2 — see clay_panic.c). When the
- * Clay runtime detects a trap (E_BOUNDS / E_DIV / E_SHIFT /
- * E_INTRINSIC), clay_panic.c writes the diagnostic to stderr and
- * then calls this hook. We forward to WAMR's exception machinery
- * so the wasm aborts cleanly without exit()ing iwasm — keeping any
- * DAP stdio channel intact for the test harness to read the
- * diagnostic.
- *
- * Reaches for the current exec env via TLS (WAMR sets this around
- * every NativeSymbol invocation), then sets the exception on its
- * module instance. The runtime function chain unwinds normally; the
- * NativeSymbol wrapper returns; WAMR notices the exception flag and
- * traps the wasm at the next instruction boundary. */
-extern wasm_exec_env_t g_clay_native_env;
-void
-sculptor_clay_panic_hook(const char *code, const char *file, int line,
-                         const char *msg)
-{
-    /* Format the full panic string ("<CODE> at <file>:<line>[: <msg>]")
-     * before handing it to WAMR, so the CLAY-RT-* decoder on the DAP
-     * side has the source location and detail to surface in the
-     * Exceptions panel. Without this, the DAP would only see WAMR's
-     * "Exception: E_DIV_ZERO" with no file/line and fall back to the
-     * generic DAP-STUB-001 wording. */
-    char buf[256];
-    if (file == NULL) file = "";
-    if (msg != NULL && msg[0] != '\0') {
-        snprintf(buf, sizeof(buf), "%s at %s:%d: %s", code, file, line, msg);
-    } else {
-        snprintf(buf, sizeof(buf), "%s at %s:%d", code, file, line);
-    }
-    /* Use the global stash that every clay_rt wrapper writes on entry;
-     * portable across both darwin (HW_BOUND_CHECK on, TLS available)
-     * and Zephyr (HW_BOUND_CHECK off, TLS always NULL). */
-    wasm_exec_env_t env = g_clay_native_env;
-    if (env != NULL) {
-        wasm_module_inst_t inst = wasm_runtime_get_module_inst(env);
-        if (inst != NULL) {
-            wasm_runtime_set_exception(inst, buf);
-        }
-    }
-    /* Don't exit — return to clay_panic, which returns to its caller,
-     * which returns up to the wasm host call. WAMR traps on return. */
-}
+/* Clay's runtime runs natively here, behind the clay_rt.* imports; its
+ * panic hook (Clay/runtime/natives/clay_wamr_panic.h) traps the program
+ * that raised a runtime error instead of letting clay_panic exit iwasm,
+ * which would close any DAP channel with it. */
+#include "clay_wamr_panic.h"
 #endif
 
 /* clang-format off */
@@ -955,11 +916,7 @@ main(int argc, char *argv[])
      * NativeSymbol invocation), sets the exception on its module
      * instance, and returns. WAMR traps the wasm at the next
      * instruction boundary. */
-    {
-        extern void (*clay_panic_hook)(const char *, const char *,
-                                       int, const char *);
-        clay_panic_hook = sculptor_clay_panic_hook;
-    }
+    clay_wamr_panic_install();
     /* Register the auto-generated clay-mock NativeSymbol table so
      * wasm modules built with clay_hw_wamr.c (the production shape:
      * `(import "clay" "<name>")` per hardware call) can instantiate

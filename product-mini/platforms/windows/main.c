@@ -17,41 +17,12 @@
 #include "../common/wasm_proposal.c"
 
 #ifdef CLAY_MOCK_NATIVES
-/* Clay panic hook (Option 2 — see clay_panic.c).  Mirrors the
- * darwin/linux logic in posix/main.c §30-75.  When the Clay runtime
- * detects an unrecoverable trap (E_BOUNDS / E_DIV / E_SHIFT /
- * E_INTRINSIC) it writes a diagnostic to stderr and calls this hook.
- * We route through WAMR's exception machinery so the wasm aborts
- * cleanly without exit()ing iwasm — keeping the DAP stdio channel
- * intact so Sculptor can surface the CLAY-RT-* diagnostic.
- *
- * Reaches for the current exec env via the global stash that every
- * clay_rt wrapper writes on entry (g_clay_native_env, defined in
- * clay_rt_natives.c).  Sets the exception on the module instance;
- * the runtime function chain unwinds normally; WAMR traps on return. */
+/* Clay's runtime runs natively here, behind the clay_rt.* imports; its
+ * panic hook (Clay/runtime/natives/clay_wamr_panic.h) traps the program
+ * that raised a runtime error instead of letting clay_panic exit iwasm,
+ * which would close the DAP channel with it. */
 #include <stdio.h>
-extern wasm_exec_env_t g_clay_native_env;
-void
-sculptor_clay_panic_hook(const char *code, const char *file, int line,
-                         const char *msg)
-{
-    char buf[256];
-    if (file == NULL)
-        file = "";
-    if (msg != NULL && msg[0] != '\0') {
-        snprintf(buf, sizeof(buf), "%s at %s:%d: %s", code, file, line, msg);
-    }
-    else {
-        snprintf(buf, sizeof(buf), "%s at %s:%d", code, file, line);
-    }
-    wasm_exec_env_t env = g_clay_native_env;
-    if (env != NULL) {
-        wasm_module_inst_t inst = wasm_runtime_get_module_inst(env);
-        if (inst != NULL) {
-            wasm_runtime_set_exception(inst, buf);
-        }
-    }
-}
+#include "clay_wamr_panic.h"
 #endif
 
 static int app_argc;
@@ -602,11 +573,7 @@ main(int argc, char *argv[])
      * "clay_mul_i32"` and similar entries stay unlinked and trap at
      * the first call.  See vendor/wamr/product-mini/platforms/windows/
      * CMakeLists.txt and clay_rt_natives.c for the data side. */
-    {
-        extern void (*clay_panic_hook)(const char *, const char *, int,
-                                       const char *);
-        clay_panic_hook = sculptor_clay_panic_hook;
-    }
+    clay_wamr_panic_install();
     {
         extern uint32_t clay_mock_natives_count(void);
         extern NativeSymbol *clay_mock_natives(void);

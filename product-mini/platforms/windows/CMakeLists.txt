@@ -158,9 +158,10 @@ if (EXISTS ${CLAY_NATIVES_CMAKE})
   add_executable (iwasm main.c
                   ${CLAY_MOCK_NATIVES_C}
                   ${CLAY_RT_NATIVES_C}
+                  ${CLAY_WAMR_PANIC_SOURCES}
                   ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
   target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
-  target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR})
+  target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR} ${CLAY_NATIVES_DIR})
 else ()
   message (STATUS "No ${CLAY_NATIVES_CMAKE}: building iwasm without the Clay natives")
   add_executable (iwasm main.c ${UNCOMMON_SHARED_SOURCE})
