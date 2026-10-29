@@ -233,6 +233,13 @@ wasm_cluster_thread_continue(WASMExecEnv *exec_env);
 void
 wasm_cluster_thread_send_signal(WASMExecEnv *exec_env, uint32 signo);
 
+/* The signal last sent to the thread and not yet cleared, or 0. A native
+ * that blocks (an embedder's sleep) reads it to return early on
+ * WAMR_SIG_TERM, which the interpreter acts on only between
+ * instructions. */
+uint32
+wasm_cluster_thread_get_signal(WASMExecEnv *exec_env);
+
 void
 wasm_cluster_thread_step(WASMExecEnv *exec_env);
 

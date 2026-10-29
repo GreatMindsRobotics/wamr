@@ -860,6 +860,12 @@ wasm_cluster_thread_send_signal(WASMExecEnv *exec_env, uint32 signo)
     exec_env->current_status->signal_flag = signo;
 }
 
+uint32
+wasm_cluster_thread_get_signal(WASMExecEnv *exec_env)
+{
+    return exec_env->current_status->signal_flag;
+}
+
 static void
 notify_debug_instance(WASMExecEnv *exec_env)
 {

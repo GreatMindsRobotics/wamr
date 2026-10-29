@@ -72,13 +72,17 @@ socket_error_is_reset(void)
 #endif
 }
 
-/* The debugger has gone: detach, which closes the connection, resumes a
- * halted program and goes back to accepting. */
+/* The debugger has gone without detaching ("D"): it closed or reset the
+ * connection, or its process ended. The program ends as it would on a
+ * kill ("k"), since nothing is left that could stop it, and the
+ * connection is closed and the engine goes back to accepting. A debugger
+ * that wants the program to go on running detaches. */
 static void
 on_debugger_disconnected(WASMGDBServer *server)
 {
+    handle_kill_request(server, NULL);
     handle_detach_request(server, NULL);
-    LOG_VERBOSE("Debugger disconnected, waiting for debugger reconnection");
+    LOG_VERBOSE("Debugger disconnected, the program is killed");
 }
 
 WASMGDBServer *
@@ -434,17 +438,18 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
     }
 
     /* setsockopt fails on a connection the debugger has reset (EINVAL on
-     * macOS), and that is a disconnect. Failing because the handle is not
-     * a socket is not: the engine is serving a socket it closed, or one a
+     * macOS), while packets it sent before the reset, a "k" among them,
+     * are still there to read. So the receive goes ahead: it returns
+     * those, and reports the reset once they are read. The receive
+     * timeout set on an earlier pass still holds, and a reset socket
+     * does not block. Failing because the handle is not a socket is
+     * different: the engine is serving a socket it closed, or one a
      * failed accept freed. */
-    if (os_socket_settimeout(server->socket_fd, 1000) != 0) {
-        if (socket_error_is_not_a_socket()) {
-            LOG_ERROR("Set socket recv timeout failed: the debugger socket "
-                      "is not an open socket");
-            return false;
-        }
-        on_debugger_disconnected(server);
-        return true;
+    if (os_socket_settimeout(server->socket_fd, 1000) != 0
+        && socket_error_is_not_a_socket()) {
+        LOG_ERROR("Set socket recv timeout failed: the debugger socket "
+                  "is not an open socket");
+        return false;
     }
 
     n = os_socket_recv(server->socket_fd, buf, sizeof(buf));
