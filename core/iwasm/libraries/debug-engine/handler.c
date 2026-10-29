@@ -1163,15 +1163,33 @@ static void
 inferior_stacks_bound(const InferiorStacks *st, WASMExecEnv *call_env)
 {
     if (st->side) {
-        if (st->side_has_sp && st->main && st->main_has_sp) {
-            call_env->aux_stack_bottom = (uintptr_t)st->side_sp;
-            call_env->aux_stack_boundary =
-                (uintptr_t)st->main->module->aux_stack_bottom;
-        }
+        call_env->aux_stack_bottom = (uintptr_t)st->side_sp;
+        call_env->aux_stack_boundary =
+            (uintptr_t)st->main->module->aux_stack_bottom;
     }
     else if (st->main_has_sp) {
         call_env->aux_stack_bottom = (uintptr_t)st->main_sp;
     }
+}
+
+/* Why a fragment cannot be bounded, or NULL when it can: its window lies
+ * between the program's stack and the program's data, so both stack
+ * pointers must be known. A fragment run unbounded could write into the
+ * program's stack, so the call is refused instead. */
+static const char *
+inferior_stacks_unboundable(const InferiorStacks *st)
+{
+    if (!st->side)
+        return NULL;
+    if (!st->main)
+        return "no paused program to place the fragment's stack against";
+    if (!st->main_has_sp)
+        return "the program has no shadow-stack pointer (__stack_pointer), "
+               "so the fragment's stack cannot be bounded";
+    if (!st->side_has_sp)
+        return "the fragment exports no __heap_base/__data_end, so its "
+               "shadow-stack pointer cannot be found and bounded";
+    return NULL;
 }
 
 void
@@ -1362,12 +1380,24 @@ process_wasm_call(WASMGDBServer *server, char *args)
      * embedder that ran the program through wasm_application_execute_main
      * already has it; any other (Brickyard) gets it here, where the
      * pointer can be put back, rather than in the middle of the call. */
+    {
+        const char *why = inferior_stacks_unboundable(&stacks);
+        if (why) {
+            emit_err_reply(server, "no-aux-stack", why);
+            os_mutex_unlock(&tmpbuf_lock);
+            return;
+        }
+    }
+
     if (main_inst && !wasm_runtime_get_exec_env_singleton(main_inst)) {
+        /* A failed creation may still have reset the pointers. */
+        inferior_stacks_restore(&stacks);
         emit_err_reply(server, "no-env",
                        "could not create the program's singleton exec_env");
         os_mutex_unlock(&tmpbuf_lock);
         return;
     }
+    inferior_stacks_restore(&stacks);
 
     /* Spin up a derived exec_env on a fresh wasm stack so the call
      * cannot disturb the paused frame. Its interpreter stack is the size
