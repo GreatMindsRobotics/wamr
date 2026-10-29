@@ -89,6 +89,24 @@ is_thread_detached(WASMDebugControlThread *control_thread)
     return control_thread->status == DETACHED;
 }
 
+/* Every status write comes here. A teardown's STOPPED can land while the
+ * control thread is acting on a debugger, and the status that action
+ * would set (RUNNING on an accept, DETACHED on a disconnect) must not
+ * replace it: the thread would then serve or accept on sockets the
+ * teardown has closed, take the failed accept for an error, and wait in
+ * wasm_debug_instance_on_failure for a stop that never comes, so the
+ * teardown's join never returns. */
+static void
+set_control_thread_status(WASMDebugControlThread *control_thread,
+                          WASMDebugControlThreadStatus status)
+{
+    os_mutex_lock(&control_thread->status_lock);
+    if (control_thread->status != STOPPED) {
+        control_thread->status = status;
+    }
+    os_mutex_unlock(&control_thread->status_lock);
+}
+
 static void *
 control_thread_routine(void *arg)
 {
@@ -100,7 +118,7 @@ control_thread_routine(void *arg)
 
     os_mutex_lock(&debug_inst->wait_lock);
 
-    control_thread->status = RUNNING;
+    set_control_thread_status(control_thread, RUNNING);
 
     debug_inst->id = allocate_instance_id();
 
@@ -161,7 +179,7 @@ control_thread_routine(void *arg)
             goto fail;
         }
 
-        control_thread->status = RUNNING;
+        set_control_thread_status(control_thread, RUNNING);
         /* when reattached, send signal */
         wasm_cluster_send_signal_all(debug_inst->cluster, WAMR_SIG_SINGSTEP);
 
@@ -215,7 +233,7 @@ control_thread_routine(void *arg)
 
                 /* Processing incoming requests */
                 if (!wasm_gdbserver_handle_packet(control_thread->server)) {
-                    control_thread->status = STOPPED;
+                    set_control_thread_status(control_thread, STOPPED);
                     LOG_ERROR("An error occurs when handling a packet\n");
                     os_mutex_unlock(&control_thread->wait_lock);
                     goto fail;
@@ -226,6 +244,11 @@ control_thread_routine(void *arg)
                 break;
             }
             else if (is_thread_stopped(control_thread)) {
+                /* A connection accepted as the teardown closed the
+                 * sockets is still open; the teardown's close and this
+                 * one are both under wait_lock, and whichever is second
+                 * finds the socket closed. */
+                wasm_gdbserver_detach(control_thread->server);
                 os_mutex_unlock(&control_thread->wait_lock);
                 return NULL;
             }
@@ -254,6 +277,10 @@ wasm_debug_control_thread_create(WASMDebugInstance *debug_instance, int32 port)
 
     if (os_mutex_init(&control_thread->wait_lock) != 0)
         goto fail;
+    if (os_mutex_init(&control_thread->status_lock) != 0) {
+        os_mutex_destroy(&control_thread->wait_lock);
+        goto fail;
+    }
 
     debug_instance->control_thread = control_thread;
 
@@ -287,6 +314,7 @@ wasm_debug_control_thread_create(WASMDebugInstance *debug_instance, int32 port)
     return control_thread;
 
 fail1:
+    os_mutex_destroy(&control_thread->status_lock);
     os_mutex_destroy(&control_thread->wait_lock);
 fail:
     wasm_runtime_free(control_thread);
@@ -300,13 +328,14 @@ wasm_debug_control_thread_destroy(WASMDebugInstance *debug_instance)
 
     LOG_VERBOSE("stopping control thread of debug object [%p]\n",
                 debug_instance);
-    control_thread->status = STOPPED;
+    set_control_thread_status(control_thread, STOPPED);
     os_mutex_lock(&control_thread->wait_lock);
     wasm_close_gdbserver(control_thread->server);
     os_mutex_unlock(&control_thread->wait_lock);
     os_thread_join(control_thread->tid, NULL);
     wasm_runtime_free(control_thread->server);
 
+    os_mutex_destroy(&control_thread->status_lock);
     os_mutex_destroy(&control_thread->wait_lock);
     wasm_runtime_free(control_thread);
 }
@@ -1207,7 +1236,7 @@ wasm_debug_instance_detach(WASMDebugInstance *instance)
 
     /* relaunch, accept new debug connection */
     instance->current_state = DBG_LAUNCHING;
-    instance->control_thread->status = DETACHED;
+    set_control_thread_status(instance->control_thread, DETACHED);
     instance->stopped_thread = NULL;
 
     return true;

@@ -232,13 +232,19 @@ wasm_close_gdbserver(WASMGDBServer *server)
     if (wasm_gdbserver_get_transport() != NULL) {
         return;
     }
+    /* Each closed socket is marked closed, so a later close of the same
+     * server (a stopping control thread's, see control_thread_routine)
+     * cannot close a descriptor the system has since reused. */
     if (socket_is_open(server->socket_fd)) {
         os_socket_shutdown(server->socket_fd);
         os_socket_close(server->socket_fd);
+        server->socket_fd = (bh_socket_t)-1;
+        server->link_closed = true;
     }
     if (socket_is_open(server->listen_fd)) {
         os_socket_shutdown(server->listen_fd);
         os_socket_close(server->listen_fd);
+        server->listen_fd = (bh_socket_t)-1;
     }
 }
 

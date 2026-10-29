@@ -25,7 +25,11 @@ typedef struct WASMDebugControlThread {
     korp_mutex wait_lock;
     char ip_addr[128];
     int port;
+    /* Written only through set_control_thread_status, under status_lock.
+     * STOPPED is final: the teardown sets it, and no later write by the
+     * control thread (an accept, a detach) may undo it. */
     WASMDebugControlThreadStatus status;
+    korp_mutex status_lock;
     struct WASMDebugEngine *debug_engine;
     struct WASMDebugInstance *debug_instance;
 } WASMDebugControlThread;
