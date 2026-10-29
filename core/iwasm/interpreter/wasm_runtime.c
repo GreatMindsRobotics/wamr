@@ -4118,7 +4118,9 @@ wasm_set_aux_stack(WASMExecEnv *exec_env, uint64 start_offset, uint32 size)
     /* Check the aux stack space */
     uint64 data_end = module_inst->module->aux_data_end;
     uint64 stack_bottom = module_inst->module->aux_stack_bottom;
-    bool is_stack_before_data = stack_bottom < data_end ? true : false;
+    /* A module linked --stack-first with no data ends its data where its
+       stack starts: the stack is still before the data. */
+    bool is_stack_before_data = stack_bottom <= data_end ? true : false;
     if ((is_stack_before_data && (size > start_offset))
         || ((!is_stack_before_data) && (start_offset - data_end < size)))
         return false;

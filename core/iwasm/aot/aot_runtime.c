@@ -3655,7 +3655,9 @@ aot_set_aux_stack(WASMExecEnv *exec_env, uint64 start_offset, uint32 size)
     uint32 stack_top_idx = module->aux_stack_top_global_index;
     uint64 data_end = module->aux_data_end;
     uint64 stack_bottom = module->aux_stack_bottom;
-    bool is_stack_before_data = stack_bottom < data_end ? true : false;
+    /* A module linked --stack-first with no data ends its data where its
+       stack starts: the stack is still before the data. */
+    bool is_stack_before_data = stack_bottom <= data_end ? true : false;
 
     /* Check the aux stack space, currently we don't allocate space in heap */
     if ((is_stack_before_data && (size > start_offset))
