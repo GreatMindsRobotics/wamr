@@ -47,6 +47,40 @@ socket_is_open(bh_socket_t fd)
     return fd != (bh_socket_t)0 && fd != (bh_socket_t)-1;
 }
 
+/* Whether the last socket call failed because the handle is not an open
+ * socket: what a call on a closed or freed handle reports. */
+static bool
+socket_error_is_not_a_socket(void)
+{
+#if defined(BH_PLATFORM_WINDOWS)
+    return WSAGetLastError() == WSAENOTSOCK;
+#else
+    return errno == EBADF || errno == ENOTSOCK;
+#endif
+}
+
+/* Whether the last recv failed because the debugger reset the connection,
+ * as a client does when it closes with bytes it has not read. */
+static bool
+socket_error_is_reset(void)
+{
+#if defined(BH_PLATFORM_WINDOWS)
+    int error = WSAGetLastError();
+    return error == WSAECONNRESET || error == WSAECONNABORTED;
+#else
+    return errno == ECONNRESET || errno == ECONNABORTED;
+#endif
+}
+
+/* The debugger has gone: detach, which closes the connection, resumes a
+ * halted program and goes back to accepting. */
+static void
+on_debugger_disconnected(WASMGDBServer *server)
+{
+    handle_detach_request(server, NULL);
+    LOG_VERBOSE("Debugger disconnected, waiting for debugger reconnection");
+}
+
 WASMGDBServer *
 wasm_create_gdbserver(const char *host, int *port)
 {
@@ -393,16 +427,24 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
         goto rx_done;
     }
 
+    /* setsockopt fails on a connection the debugger has reset (EINVAL on
+     * macOS), and that is a disconnect. Failing because the handle is not
+     * a socket is not: the engine is serving a socket it closed, or one a
+     * failed accept freed. */
     if (os_socket_settimeout(server->socket_fd, 1000) != 0) {
-        LOG_ERROR("Set socket recv timeout failed");
-        return false;
+        if (socket_error_is_not_a_socket()) {
+            LOG_ERROR("Set socket recv timeout failed: the debugger socket "
+                      "is not an open socket");
+            return false;
+        }
+        on_debugger_disconnected(server);
+        return true;
     }
 
     n = os_socket_recv(server->socket_fd, buf, sizeof(buf));
 
     if (n == 0) {
-        handle_detach_request(server, NULL);
-        LOG_VERBOSE("Debugger disconnected, waiting for debugger reconnection");
+        on_debugger_disconnected(server);
         return true;
     }
     else if (n < 0) {
@@ -413,6 +455,10 @@ wasm_gdbserver_handle_packet(WASMGDBServer *server)
 #endif
         {
             /* No bytes arrived */
+            return true;
+        }
+        else if (socket_error_is_reset()) {
+            on_debugger_disconnected(server);
             return true;
         }
         else {
