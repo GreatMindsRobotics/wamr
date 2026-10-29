@@ -140,6 +140,12 @@ if (EXISTS ${CLAY_NATIVES_CMAKE})
                   ${CLAY_WAMR_PANIC_SOURCES}
                   ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
   target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
+  # Sculptor's debugger evaluates through the IW REPL (qWasmLoadSide and
+  # qWasmCall) and never asks the debug engine for memory in the target
+  # (`_M`). A Clay program's linear memory is fixed by the WAMR program
+  # profile and cannot hold lldb's default buffer, so the engine takes
+  # none rather than warning that it could not.
+  add_definitions (-DDEBUG_EXECUTION_MEMORY_SIZE=0)
   target_include_directories (iwasm PRIVATE ${CLAY_RUNTIME_DIR} ${CLAY_NATIVES_DIR})
 else ()
   message (STATUS "No ${CLAY_NATIVES_CMAKE}: building iwasm without the Clay natives")

@@ -654,10 +654,16 @@ signal_callback(int sig_num, siginfo_t *sig_info, void *sig_ucontext)
     }
 }
 
+static bool
+signal_act_is_ours(const struct sigaction *act)
+{
+    return (act->sa_flags & SA_SIGINFO) && act->sa_sigaction == signal_callback;
+}
+
 int
 os_thread_signal_init(os_signal_handler handler)
 {
-    struct sigaction sig_act;
+    struct sigaction sig_act, old_sig_act_SIGSEGV, old_sig_act_SIGBUS;
 #if WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
     stack_t sigalt_stack_info;
     uint32 map_size = SIG_ALT_STACK_SIZE;
@@ -693,8 +699,8 @@ os_thread_signal_init(os_signal_handler handler)
     }
 #endif
 
-    memset(&prev_sig_act_SIGSEGV, 0, sizeof(struct sigaction));
-    memset(&prev_sig_act_SIGBUS, 0, sizeof(struct sigaction));
+    memset(&old_sig_act_SIGSEGV, 0, sizeof(struct sigaction));
+    memset(&old_sig_act_SIGBUS, 0, sizeof(struct sigaction));
 
     /* Install signal handler */
     sig_act.sa_sigaction = signal_callback;
@@ -703,11 +709,22 @@ os_thread_signal_init(os_signal_handler handler)
     sig_act.sa_flags |= SA_ONSTACK;
 #endif
     sigemptyset(&sig_act.sa_mask);
-    if (sigaction(SIGSEGV, &sig_act, &prev_sig_act_SIGSEGV) != 0
-        || sigaction(SIGBUS, &sig_act, &prev_sig_act_SIGBUS) != 0) {
+    if (sigaction(SIGSEGV, &sig_act, &old_sig_act_SIGSEGV) != 0
+        || sigaction(SIGBUS, &sig_act, &old_sig_act_SIGBUS) != 0) {
         os_printf("Failed to register signal handler\n");
         goto fail3;
     }
+
+    /* The handlers are process-wide, so a second thread's init finds
+     * signal_callback already installed. Keep forwarding to the handler
+     * that was there before WAMR's: recording signal_callback as its own
+     * predecessor makes a fault outside wasm, such as one in the debug
+     * engine's control thread, recurse in signal_callback forever instead
+     * of reaching the abort below. */
+    if (!signal_act_is_ours(&old_sig_act_SIGSEGV))
+        prev_sig_act_SIGSEGV = old_sig_act_SIGSEGV;
+    if (!signal_act_is_ours(&old_sig_act_SIGBUS))
+        prev_sig_act_SIGBUS = old_sig_act_SIGBUS;
 
 #if WASM_DISABLE_STACK_HW_BOUND_CHECK == 0
     sigalt_stack_base_addr = map_addr;

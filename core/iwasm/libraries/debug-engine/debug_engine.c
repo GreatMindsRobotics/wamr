@@ -422,16 +422,21 @@ wasm_debug_instance_create(WASMCluster *cluster, int32 port)
 
     /* Allocate linear memory for evaluating expressions during debugging. If
      * the allocation failed, the debugger will not be able to evaluate
-     * expressions */
+     * expressions. An embedder whose debugger never allocates in the
+     * target (`_M`) builds with DEBUG_EXECUTION_MEMORY_SIZE 0: nothing is
+     * taken from the program's heap and `_M` is refused. */
     instance->exec_mem_info.size = DEBUG_EXECUTION_MEMORY_SIZE;
-    instance->exec_mem_info.start_offset = wasm_runtime_module_malloc(
-        module_inst, (uint64)instance->exec_mem_info.size, NULL);
-    if (instance->exec_mem_info.start_offset == 0) {
-        LOG_WARNING(
-            "WASM Debug Engine warning: failed to allocate linear memory for "
-            "execution. \n"
-            "Will not be able to evaluate expressions during "
-            "debugging");
+    instance->exec_mem_info.start_offset = 0;
+    if (instance->exec_mem_info.size > 0) {
+        instance->exec_mem_info.start_offset = wasm_runtime_module_malloc(
+            module_inst, (uint64)instance->exec_mem_info.size, NULL);
+        if (instance->exec_mem_info.start_offset == 0) {
+            LOG_WARNING(
+                "WASM Debug Engine warning: failed to allocate linear memory "
+                "for execution. \n"
+                "Will not be able to evaluate expressions during "
+                "debugging");
+        }
     }
     instance->exec_mem_info.current_pos = instance->exec_mem_info.start_offset;
 
@@ -1266,6 +1271,31 @@ wasm_debug_instance_singlestep(WASMDebugInstance *instance, korp_tid tid)
     return true;
 }
 
+/* The paused thread's frame at frame_index, numbered as
+ * wasm_debug_instance_get_call_stack_pcs (qWasmCallStack) numbers them:
+ * only frames with an ip, which are the wasm functions' frames. A native
+ * import's frame has none and no wasm locals; it is still the innermost
+ * frame when the import raised the exception the thread stopped on, as a
+ * Clay runtime error does. Counting it would give every index the frame
+ * one further in, and frame 0 a function with no local_offsets. */
+static struct WASMInterpFrame *
+debug_frame_at(WASMExecEnv *exec_env, int32 frame_index)
+{
+    struct WASMInterpFrame *frame;
+    int32 fi = 0;
+
+    if (frame_index < 0)
+        return NULL;
+
+    for (frame = exec_env->cur_frame; frame; frame = frame->prev_frame) {
+        if (frame->ip == NULL)
+            continue;
+        if (fi++ == frame_index)
+            return frame;
+    }
+    return NULL;
+}
+
 bool
 wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
                               int32 local_index, char buf[], int32 *size)
@@ -1276,7 +1306,6 @@ wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
     uint8 local_type = 0xFF;
     uint32 local_offset;
     int32 param_count;
-    int32 fi = 0;
 
     if (!instance)
         return false;
@@ -1285,10 +1314,7 @@ wasm_debug_instance_get_local(WASMDebugInstance *instance, int32 frame_index,
     if (!exec_env)
         return false;
 
-    frame = exec_env->cur_frame;
-    while (frame && fi++ != frame_index) {
-        frame = frame->prev_frame;
-    }
+    frame = debug_frame_at(exec_env, frame_index);
 
     if (!frame)
         return false;
@@ -1404,7 +1430,6 @@ wasm_debug_instance_set_local(WASMDebugInstance *instance, int32 frame_index,
     uint8 local_type = 0xFF;
     uint32 local_offset;
     int32 param_count;
-    int32 fi = 0;
 
     if (!instance)
         return false;
@@ -1413,10 +1438,7 @@ wasm_debug_instance_set_local(WASMDebugInstance *instance, int32 frame_index,
     if (!exec_env)
         return false;
 
-    frame = exec_env->cur_frame;
-    while (frame && fi++ != frame_index) {
-        frame = frame->prev_frame;
-    }
+    frame = debug_frame_at(exec_env, frame_index);
 
     if (!frame)
         return false;
@@ -1461,7 +1483,6 @@ wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
     uint8 *global_addr;
     uint8 global_type = 0xFF;
     uint8 *global_data;
-    int32 fi = 0;
 
     if (!instance)
         return false;
@@ -1470,10 +1491,7 @@ wasm_debug_instance_get_global(WASMDebugInstance *instance, int32 frame_index,
     if (!exec_env)
         return false;
 
-    frame = exec_env->cur_frame;
-    while (frame && fi++ != frame_index) {
-        frame = frame->prev_frame;
-    }
+    frame = debug_frame_at(exec_env, frame_index);
 
     if (!frame)
         return false;
