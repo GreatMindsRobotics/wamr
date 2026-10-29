@@ -1093,6 +1093,87 @@ process_wasm_unload_side(WASMGDBServer *server, char *args)
     os_mutex_unlock(&tmpbuf_lock);
 }
 
+/* An inferior call's hold on the shadow stacks (the __stack_pointer
+ * global wasm-ld emits, which the loader records as the module's aux stack
+ * top) of the paused program and of the fragment it calls.
+ *
+ * Creating an exec_env for an instance (wasm_cluster_create ->
+ * wasm_exec_env_set_aux_stack) writes that instance's stack pointer back
+ * to the top of its stack. For the paused program that would put the
+ * call's frames over the program's outermost ones, and leave the program
+ * resuming with a stack pointer that is not its own. So the call saves
+ * both stack pointers first, puts them back once its exec_env exists, and
+ * again when the call ends, trapped or not, since a trap skips the
+ * epilogues that would have restored them. */
+typedef struct InferiorStacks {
+    WASMModuleInstance *main;
+    bool main_has_sp;
+    uint32 main_sp;
+    WASMModuleInstance *side;
+    bool side_has_sp;
+    uint32 side_sp;
+} InferiorStacks;
+
+static uint32 *
+aux_sp_addr(WASMModuleInstance *inst)
+{
+    uint32 idx = inst->module->aux_stack_top_global_index;
+    if (idx == (uint32)-1 || !inst->e || !inst->e->globals)
+        return NULL;
+    return (uint32 *)(inst->global_data + inst->e->globals[idx].data_offset);
+}
+
+static void
+inferior_stacks_save(InferiorStacks *st, WASMModuleInstance *main,
+                     WASMModuleInstance *side)
+{
+    uint32 *addr;
+
+    memset(st, 0, sizeof(*st));
+    st->main = main;
+    st->side = side;
+    if (main && (addr = aux_sp_addr(main))) {
+        st->main_has_sp = true;
+        st->main_sp = *addr;
+    }
+    if (side && (addr = aux_sp_addr(side))) {
+        st->side_has_sp = true;
+        st->side_sp = *addr;
+    }
+}
+
+static void
+inferior_stacks_restore(const InferiorStacks *st)
+{
+    if (st->main_has_sp)
+        *aux_sp_addr(st->main) = st->main_sp;
+    if (st->side_has_sp)
+        *aux_sp_addr(st->side) = st->side_sp;
+}
+
+/* Bound the call's shadow stack to the space it may use, so overflowing
+ * it traps as "wasm auxiliary stack overflow" instead of writing over
+ * live memory:
+ *  - a call into the paused program grows down from where the program
+ *    stopped, to the bottom of the program's stack;
+ *  - a fragment's stack sits in the window above the program's stack
+ *    (the WAMR program profile in OpenBrick's clay_runtime.h), so it grows
+ *    down from where it was linked to the top of the program's stack. */
+static void
+inferior_stacks_bound(const InferiorStacks *st, WASMExecEnv *call_env)
+{
+    if (st->side) {
+        if (st->side_has_sp && st->main && st->main_has_sp) {
+            call_env->aux_stack_bottom = (uintptr_t)st->side_sp;
+            call_env->aux_stack_boundary =
+                (uintptr_t)st->main->module->aux_stack_bottom;
+        }
+    }
+    else if (st->main_has_sp) {
+        call_env->aux_stack_bottom = (uintptr_t)st->main_sp;
+    }
+}
+
 void
 process_wasm_call(WASMGDBServer *server, char *args)
 {
@@ -1122,6 +1203,10 @@ process_wasm_call(WASMGDBServer *server, char *args)
     bool aborted = false;
     uint32 side_handle = 0;
     WasmSideModule *side = NULL;
+    wasm_module_inst_t main_inst = NULL;
+    InferiorStacks stacks;
+    uint32 call_stack_size;
+    bool main_had_exception = false;
 
     /* Two forms (subplan #4 Parts A and G):
      *   1-segment-pair: qWasmCall:<funcname-hex>:<argbytes-hex>
@@ -1168,6 +1253,13 @@ process_wasm_call(WASMGDBServer *server, char *args)
     }
     funcname[name_len] = '\0';
 
+    /* The paused program, which both forms need: a fragment shares its
+     * memory and calls into it. */
+    debug_inst = (WASMDebugInstance *)server->thread->debug_instance;
+    paused_env = wasm_debug_instance_get_current_env(debug_inst);
+    if (paused_env)
+        main_inst = wasm_runtime_get_module_inst(paused_env);
+
     /* Resolve the target instance: side module if handle given,
      * otherwise the paused main instance. */
     if (side_handle != 0) {
@@ -1181,15 +1273,13 @@ process_wasm_call(WASMGDBServer *server, char *args)
         module_inst = side->instance;
     }
     else {
-        debug_inst = (WASMDebugInstance *)server->thread->debug_instance;
-        paused_env = wasm_debug_instance_get_current_env(debug_inst);
         if (!paused_env) {
             emit_err_reply(server, "no-env",
                            "no paused exec_env on debug instance");
             os_mutex_unlock(&tmpbuf_lock);
             return;
         }
-        module_inst = wasm_runtime_get_module_inst(paused_env);
+        module_inst = main_inst;
         if (!module_inst) {
             emit_err_reply(server, "no-inst",
                            "no module instance on paused exec_env");
@@ -1263,21 +1353,48 @@ process_wasm_call(WASMGDBServer *server, char *args)
         return;
     }
 
+    inferior_stacks_save(&stacks, (WASMModuleInstance *)main_inst,
+                         side ? (WASMModuleInstance *)module_inst : NULL);
+
+    /* A fragment's calls into the program run on the program's singleton
+     * exec_env's stack bounds (wasm_interp_classic.c's sub-module call),
+     * and creating that singleton resets the program's stack pointer. An
+     * embedder that ran the program through wasm_application_execute_main
+     * already has it; any other (Brickyard) gets it here, where the
+     * pointer can be put back, rather than in the middle of the call. */
+    if (main_inst && !wasm_runtime_get_exec_env_singleton(main_inst)) {
+        emit_err_reply(server, "no-env",
+                       "could not create the program's singleton exec_env");
+        os_mutex_unlock(&tmpbuf_lock);
+        return;
+    }
+
     /* Spin up a derived exec_env on a fresh wasm stack so the call
-     * cannot disturb the paused frame. The 64 KiB is why an embedded
-     * target needs pool headroom beyond the running program: see
-     * Brick/working_with_nucleo_h7a3.md. */
-    call_env = wasm_runtime_create_exec_env(module_inst, 64 * 1024);
+     * cannot disturb the paused frame. Its interpreter stack is the size
+     * the embedder gave the program's instance (CLAY_WAMR_STACK_BYTES in
+     * OpenBrick's clay_runtime.h), so a call into the program has the
+     * room the runtime's call-depth limit assumes. It is also why an
+     * embedded target needs pool headroom beyond the running program:
+     * see Brick/working_with_nucleo_h7a3.md. */
+    call_stack_size = 64 * 1024;
+    if (main_inst)
+        call_stack_size =
+            ((WASMModuleInstance *)main_inst)->default_wasm_stack_size;
+    call_env = wasm_runtime_create_exec_env(module_inst, call_stack_size);
+    inferior_stacks_restore(&stacks);
     if (!call_env) {
         emit_err_reply(server, "no-env", "wasm_runtime_create_exec_env failed");
         os_mutex_unlock(&tmpbuf_lock);
         return;
     }
+    inferior_stacks_bound(&stacks, call_env);
 
     /* Clear any prior exception on the module instance so we can
      * distinguish "this call trapped" from "an earlier call left
      * an exception lying around". */
     wasm_runtime_set_exception(module_inst, NULL);
+    if (main_inst && main_inst != module_inst)
+        main_had_exception = wasm_runtime_get_exception(main_inst) != NULL;
 
     /* Part B2: install per-call stdout capture so wasi fd_write
      * during the inferior call routes into our buffer instead of
@@ -1296,6 +1413,14 @@ process_wasm_call(WASMGDBServer *server, char *args)
     else {
         ok = wasm_runtime_call_wasm(call_env, func, cell_idx, argv_cells);
     }
+    inferior_stacks_restore(&stacks);
+    /* A trap inside one of the program's functions, called from a
+     * fragment, is raised on the program's instance as well as passed up
+     * to the fragment's. The reply carries it from the fragment; left on
+     * the program, every later call into it, and the program itself once
+     * resumed, would fail with it. */
+    if (main_inst && main_inst != module_inst && !main_had_exception)
+        wasm_runtime_set_exception(main_inst, NULL);
 
     {
         const char *captured_stdout = NULL;
