@@ -93,10 +93,88 @@ print_help(void)
     printf("  -g=ip:port               Set the debug sever address, default is debug disabled\n");
     printf("                           if port is 0, then a random port will be used\n");
 #endif
+    printf("  --exit-with-parent=pid   Exit, with status 3, as soon as process <pid> exits;\n"
+           "                           a launcher passes its own pid so that iwasm\n"
+           "                           does not outlive it\n");
     printf("  --version                Show version information\n");
     return 1;
 }
 /* clang-format on */
+
+/* --exit-with-parent=<pid>: iwasm ends when the process that started it
+ * does, however that process ends, so a debug server cannot outlive the
+ * debugger that launched it. iwasm exits with PARENT_EXITED_STATUS and a
+ * line on stderr. */
+#define PARENT_EXITED_STATUS 3
+
+/* The watched pid, for the exit message. */
+static DWORD parent_watch_pid;
+
+static void
+exit_parent_gone(void)
+{
+    fprintf(
+        stderr,
+        "iwasm: exiting because process %lu (--exit-with-parent) has exited\n",
+        (unsigned long)parent_watch_pid);
+    fflush(stderr);
+    /* TerminateProcess, not exit or ExitProcess: the main thread may be
+     * running the program, and CRT teardown or DLL detach notifications
+     * would race it or wait on a lock it holds. */
+    TerminateProcess(GetCurrentProcess(), PARENT_EXITED_STATUS);
+}
+
+static DWORD WINAPI
+parent_watch_routine(LPVOID arg)
+{
+    HANDLE parent = (HANDLE)arg;
+
+    if (WaitForSingleObject(parent, INFINITE) != WAIT_OBJECT_0) {
+        /* Without the watch iwasm could outlive its launcher unseen, so
+         * the failure ends it as the parent's exit would. */
+        fprintf(stderr,
+                "iwasm: lost the --exit-with-parent watch on %lu: error %lu\n",
+                (unsigned long)parent_watch_pid, (unsigned long)GetLastError());
+    }
+    exit_parent_gone();
+    return 0;
+}
+
+/* Opens `pid` for waiting and starts the thread that waits for it.
+ * Exits at once when `pid` is already gone. Returns false, having said
+ * why on stderr, when the watch cannot be set up. */
+static bool
+start_parent_watch(DWORD pid)
+{
+    HANDLE parent, thread;
+    DWORD err;
+
+    parent_watch_pid = pid;
+    parent = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (parent == NULL) {
+        err = GetLastError();
+        /* No process has that pid. */
+        if (err == ERROR_INVALID_PARAMETER) {
+            exit_parent_gone();
+        }
+        fprintf(
+            stderr,
+            "iwasm: --exit-with-parent: cannot open process %lu: error %lu\n",
+            (unsigned long)pid, (unsigned long)err);
+        return false;
+    }
+    thread = CreateThread(NULL, 0, parent_watch_routine, parent, 0, NULL);
+    if (thread == NULL) {
+        fprintf(stderr,
+                "iwasm: --exit-with-parent: cannot start the watch thread: "
+                "error %lu\n",
+                (unsigned long)GetLastError());
+        CloseHandle(parent);
+        return false;
+    }
+    CloseHandle(thread);
+    return true;
+}
 
 static const void *
 app_instance_main(wasm_module_inst_t module_inst)
@@ -345,6 +423,7 @@ main(int argc, char *argv[])
     char *ip_addr = NULL;
     int instance_port = 0;
 #endif
+    unsigned long parent_pid = 0;
 
 #if WASM_ENABLE_LIBC_WASI != 0
     memset(&wasi_parse_ctx, 0, sizeof(wasi_parse_ctx));
@@ -486,6 +565,13 @@ main(int argc, char *argv[])
             ip_addr = argv[0] + 3;
         }
 #endif
+        else if (!strncmp(argv[0], "--exit-with-parent=", 19)) {
+            char *pid_end;
+            parent_pid = strtoul(argv[0] + 19, &pid_end, 10);
+            if (argv[0][19] < '0' || argv[0][19] > '9' || *pid_end != '\0'
+                || parent_pid == 0)
+                return print_help();
+        }
         else if (!strcmp(argv[0], "--version")) {
             uint32 major, minor, patch;
             wasm_runtime_get_version(&major, &minor, &patch);
@@ -515,6 +601,9 @@ main(int argc, char *argv[])
 
     if (argc == 0)
         return print_help();
+
+    if (parent_pid != 0 && !start_parent_watch((DWORD)parent_pid))
+        return 1;
 
     wasm_file = argv[0];
     app_argc = argc;

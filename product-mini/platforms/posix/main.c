@@ -124,10 +124,117 @@ print_help(void)
 #if WASM_ENABLE_STATIC_PGO != 0
     printf("  --gen-prof-file=<path>   Generate LLVM PGO (Profile-Guided Optimization) profile file\n");
 #endif
+    printf("  --exit-with-parent=pid   Exit, with status 3, as soon as process <pid> exits;\n"
+           "                           a launcher passes its own pid so that iwasm\n"
+           "                           does not outlive it\n");
     printf("  --version                Show version information\n");
     return 1;
 }
 /* clang-format on */
+
+/* --exit-with-parent=<pid>: iwasm ends when the process that started it
+ * does, however that process ends, so a debug server cannot outlive the
+ * debugger that launched it. The launcher names itself rather than iwasm
+ * reading getppid(), which could name init if the launcher had already
+ * died by then. iwasm exits with PARENT_EXITED_STATUS and a line on
+ * stderr. macOS only among the posix platforms: elsewhere the option is
+ * refused rather than accepted and ignored. */
+#define PARENT_EXITED_STATUS 3
+
+#if defined(__APPLE__)
+#include <errno.h>
+#include <pthread.h>
+#include <sys/event.h>
+#include <unistd.h>
+
+static void
+exit_parent_gone(long pid)
+{
+    fprintf(
+        stderr,
+        "iwasm: exiting because process %ld (--exit-with-parent) has exited\n",
+        pid);
+    fflush(stderr);
+    /* _exit, not exit: the main thread may be running the program, and
+     * atexit handlers and stdio teardown would race it. */
+    _exit(PARENT_EXITED_STATUS);
+}
+
+/* The kqueue holding the NOTE_EXIT registration for the watched pid. */
+static int parent_watch_kq = -1;
+/* The watched pid, for the exit message. */
+static long parent_watch_pid;
+
+static void *
+parent_watch_routine(void *arg)
+{
+    struct kevent event;
+    int n;
+
+    (void)arg;
+    do {
+        n = kevent(parent_watch_kq, NULL, 0, &event, 1, NULL);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        /* Without the watch iwasm could outlive its launcher unseen, so
+         * the failure ends it as the parent's exit would. */
+        fprintf(stderr, "iwasm: lost the --exit-with-parent watch on %ld: %s\n",
+                parent_watch_pid, strerror(errno));
+    }
+    exit_parent_gone(parent_watch_pid);
+    return NULL;
+}
+
+/* Registers for the exit of `pid` and starts the thread that waits for
+ * it, blocked in kevent. Exits at once when `pid` is already gone.
+ * Returns false, having said why on stderr, when the watch cannot be
+ * set up. */
+static bool
+start_parent_watch(long pid)
+{
+    struct kevent change;
+    pthread_t tid;
+    int err;
+
+    parent_watch_pid = pid;
+    parent_watch_kq = kqueue();
+    if (parent_watch_kq < 0) {
+        fprintf(stderr, "iwasm: --exit-with-parent: kqueue failed: %s\n",
+                strerror(errno));
+        return false;
+    }
+    EV_SET(&change, (uintptr_t)pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT,
+           0, NULL);
+    if (kevent(parent_watch_kq, &change, 1, NULL, 0, NULL) < 0) {
+        if (errno == ESRCH) {
+            exit_parent_gone(pid);
+        }
+        fprintf(stderr,
+                "iwasm: --exit-with-parent: cannot watch process %ld: %s\n",
+                pid, strerror(errno));
+        return false;
+    }
+    err = pthread_create(&tid, NULL, parent_watch_routine, NULL);
+    if (err != 0) {
+        fprintf(
+            stderr,
+            "iwasm: --exit-with-parent: cannot start the watch thread: %s\n",
+            strerror(err));
+        return false;
+    }
+    pthread_detach(tid);
+    return true;
+}
+#else
+static bool
+start_parent_watch(long pid)
+{
+    (void)pid;
+    fprintf(stderr,
+            "iwasm: --exit-with-parent is not supported on this platform\n");
+    return false;
+}
+#endif
 
 static const void *
 app_instance_main(wasm_module_inst_t module_inst)
@@ -642,6 +749,7 @@ main(int argc, char *argv[])
 #if WASM_ENABLE_THREAD_MGR != 0
     int timeout_ms = -1;
 #endif
+    long parent_pid = 0;
 
 #if WASM_ENABLE_LIBC_WASI != 0
     memset(&wasi_parse_ctx, 0, sizeof(wasi_parse_ctx));
@@ -824,6 +932,13 @@ main(int argc, char *argv[])
             gen_prof_file = argv[0] + 16;
         }
 #endif
+        else if (!strncmp(argv[0], "--exit-with-parent=", 19)) {
+            char *pid_end;
+            parent_pid = strtol(argv[0] + 19, &pid_end, 10);
+            if (argv[0][19] < '0' || argv[0][19] > '9' || *pid_end != '\0'
+                || parent_pid <= 0)
+                return print_help();
+        }
         else if (!strcmp(argv[0], "--version")) {
             uint32 major, minor, patch;
             wasm_runtime_get_version(&major, &minor, &patch);
@@ -853,6 +968,9 @@ main(int argc, char *argv[])
 
     if (argc == 0)
         return print_help();
+
+    if (parent_pid > 0 && !start_parent_watch(parent_pid))
+        return 1;
 
     wasm_file = argv[0];
     app_argc = argc;
