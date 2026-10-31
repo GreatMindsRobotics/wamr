@@ -681,6 +681,47 @@ wasm_debug_handler_module_unloaded(struct WASMModuleCommon *module)
     }
 }
 
+/* Whether every function the side module imports, except those from
+ * the paused program, bound to a registered native. When one did not,
+ * writes "this target does not provide <module>.<name>, ..." into err,
+ * as many names as fit. */
+static bool
+side_imports_bound(wasm_module_t side_module, char *err, size_t err_cap)
+{
+    size_t off = 0;
+    int32 missing = 0;
+    int32 n = wasm_runtime_get_import_count(side_module);
+    int32 i;
+
+    for (i = 0; i < n; i++) {
+        wasm_import_t imp;
+        int need;
+        wasm_runtime_get_import_type(side_module, i, &imp);
+        if (imp.kind != WASM_IMPORT_EXPORT_KIND_FUNC || imp.linked
+            || strcmp(imp.module_name, SIDE_MAIN_REGISTRY_NAME) == 0) {
+            continue;
+        }
+        if (missing == 0) {
+            need = snprintf(err, err_cap, "this target does not provide %s.%s",
+                            imp.module_name, imp.name);
+        }
+        else {
+            need = snprintf(err + off, err_cap - off, ", %s.%s",
+                            imp.module_name, imp.name);
+        }
+        missing++;
+        if (need < 0 || (size_t)need >= err_cap - off) {
+            /* Keep only the whole names that fit. */
+            if (off > 0) {
+                err[off] = '\0';
+            }
+            break;
+        }
+        off += (size_t)need;
+    }
+    return missing == 0;
+}
+
 /* Register the main module under SIDE_MAIN_REGISTRY_NAME so side
  * modules' imports of the form `(import "main" "<sym>" ...)` resolve
  * at instantiation. Idempotent for one main module; a different one
@@ -919,6 +960,20 @@ process_wasm_load_side(WASMGDBServer *server, char *args)
             return;
         }
         m->module = side_module;
+
+        /* Refuse a fragment that imports a function no native is
+         * registered for, naming each, rather than instantiating it and
+         * trapping on the call: a fragment calls the embedder's natives
+         * directly (it links its own hardware wrappers), so an unbound
+         * import is an operation this target does not provide. Imports
+         * from the paused program are bound after instantiation (the
+         * rebind below), so they are not natives and are skipped. */
+        if (!side_imports_bound(side_module, err, sizeof(err))) {
+            emit_err_reply(server, "link-error", err);
+            destroy_side_module(m);
+            os_mutex_unlock(&tmpbuf_lock);
+            return;
+        }
 
         /* Sculptor IW REPL: tell wasm_allocate_linear_memory
          * and wasm_runtime.c's data-segment-init loop to skip the

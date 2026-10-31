@@ -138,6 +138,7 @@ if (EXISTS ${CLAY_NATIVES_CMAKE})
                   ${CLAY_MOCK_NATIVES_C}
                   ${CLAY_RT_NATIVES_C}
                   ${CLAY_WAMR_PANIC_SOURCES}
+                  ${CLAY_IMPORT_CHECK_SOURCES}
                   ${CLAY_RUNTIME_SOURCES} ${UNCOMMON_SHARED_SOURCE})
   target_compile_definitions (iwasm PRIVATE CLAY_MOCK_NATIVES=1)
   # Sculptor's debugger evaluates through the IW REPL (qWasmLoadSide and

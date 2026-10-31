@@ -22,6 +22,7 @@
  * that raised a runtime error instead of letting clay_panic exit iwasm,
  * which would close the DAP channel with it. */
 #include <stdio.h>
+#include "clay_import_check.h"
 #include "clay_wamr_panic.h"
 #endif
 
@@ -724,6 +725,24 @@ main(int argc, char *argv[])
         printf("%s\n", error_buf);
         goto fail2;
     }
+
+#ifdef CLAY_MOCK_NATIVES
+    /* Refuse, before it starts, a module importing a function no native
+     * is registered for (Clay/runtime/natives/clay_import_check.h): a
+     * Clay program imports exactly the operations it calls, so this is
+     * one the host does not provide. WAMR would otherwise run it and trap
+     * only when the call is reached. */
+    {
+        char missing[512];
+        if (clay_import_check(wasm_module, missing, sizeof(missing)) > 0) {
+            fprintf(stderr,
+                    "%s was not started: it uses %s, which this iwasm does "
+                    "not provide\n",
+                    wasm_file, missing);
+            goto fail3;
+        }
+    }
+#endif
 
     if (!wasm_runtime_instantiation_args_create(&inst_args)) {
         printf("failed to create instantiate args\n");
