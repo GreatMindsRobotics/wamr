@@ -1128,7 +1128,7 @@ main(int argc, char *argv[])
 #ifdef CLAY_MOCK_NATIVES
     /* Refuse, before it starts, a module importing a function no native
      * is registered for (Clay/runtime/natives/clay_import_check.h): a
-     * Clay program imports exactly the operations it calls, so this is
+     * Clay program imports the operations its functions use, called or not, so this is
      * one the host does not provide. WAMR would otherwise run it and trap
      * only when the call is reached. */
     {
