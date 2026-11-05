@@ -1319,6 +1319,41 @@ WASM_RUNTIME_API_EXTERN bool
 wasm_application_execute_func(wasm_module_inst_t module_inst, const char *name,
                               int32_t argc, char *argv[]);
 
+/* A float result the interpreter stopped on. */
+typedef enum wasm_float_trap_kind_t {
+    WASM_FLOAT_TRAP_NON_FINITE,
+    WASM_FLOAT_TRAP_DIV_ZERO,
+} wasm_float_trap_kind_t;
+
+/* The exception text a native sets when it finds a non-finite result it can't
+ * place: the interpreter hands it to the handler with the caller's position. */
+#define WASM_FLOAT_TRAP_UNPLACED "float result unplaced"
+
+/**
+ * Decides what a non-finite float result means, once the classic interpreter
+ * built with WAMR_BUILD_FLOAT_TRAP has seen one.
+ *
+ * @param bytes the module's bytes as loaded, and size their length
+ * @param ips the bytecode positions of the frames, innermost first
+ * @param ip_count how many; the walk stops at a small fixed depth
+ *
+ * @return true when it has set the exception, so the program stops; false to
+ *         let the value go on, as it does for a module that checks its own
+ */
+typedef bool (*wasm_float_trap_handler_t)(wasm_exec_env_t exec_env,
+                                          wasm_module_inst_t module_inst,
+                                          wasm_float_trap_kind_t kind,
+                                          const uint8_t *bytes, uint32_t size,
+                                          const uint8_t *const *ips,
+                                          uint32_t ip_count);
+
+/**
+ * Sets the handler, for every module instance. With none, a non-finite result
+ * stops the program with E_NON_FINITE or E_DIV_ZERO and no position.
+ */
+WASM_RUNTIME_API_EXTERN void
+wasm_runtime_set_float_trap_handler(wasm_float_trap_handler_t handler);
+
 /**
  * Get exception info of the WASM module instance.
  *

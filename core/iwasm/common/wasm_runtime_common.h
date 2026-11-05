@@ -955,6 +955,11 @@ WASM_RUNTIME_API_EXTERN bool
 wasm_application_execute_func(WASMModuleInstanceCommon *module_inst,
                               const char *name, int32 argc, char *argv[]);
 
+#if WASM_ENABLE_FLOAT_TRAP != 0
+wasm_float_trap_handler_t
+wasm_runtime_get_float_trap_handler(void);
+#endif
+
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN void
 wasm_runtime_set_exception(WASMModuleInstanceCommon *module,

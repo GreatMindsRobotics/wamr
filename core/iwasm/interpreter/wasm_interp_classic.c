@@ -814,6 +814,97 @@ wasm_interp_get_frame_ref(WASMInterpFrame *frame)
         PUSH_##src_op_type(val2);                          \
     } while (0)
 
+#if WASM_ENABLE_FLOAT_TRAP != 0
+#if WASM_ENABLE_DEBUG_INTERP == 0
+#error "WASM_ENABLE_FLOAT_TRAP reads frame_ip_orig, which DEBUG_INTERP keeps"
+#endif
+
+/* An embedding that sets a float trap handler stops a program on the first
+ * float result that is infinity or NaN. Any finite operand gives a finite
+ * result on every other float opcode, so only these are checked: add, sub, mul,
+ * div, sqrt, demote, const, and a native's return. The test is one compare on
+ * the value already on the stack; the handler runs only when it trips.
+ *
+ * The f64 test reads the high word, the upper stack cell. */
+#define FLOAT_TRAP_F32_TRIPS() \
+    ((frame_sp[-1] & 0x7f800000u) == 0x7f800000u)
+#define FLOAT_TRAP_F64_TRIPS() \
+    ((frame_sp[-1] & 0x7ff00000u) == 0x7ff00000u)
+
+#define FLOAT_TRAP_DEPTH 8
+
+/* True when the program stops: the handler, or the default with no handler,
+ * has set the exception. False when the handler lets the value go on. */
+static bool
+float_trap_raise(WASMExecEnv *exec_env, WASMModuleInstance *module,
+                 WASMInterpFrame *frame, const uint8 *ip,
+                 wasm_float_trap_kind_t kind)
+{
+    const uint8 *ips[FLOAT_TRAP_DEPTH];
+    uint32 count = 0;
+    wasm_float_trap_handler_t handler = wasm_runtime_get_float_trap_handler();
+
+    if (!handler) {
+        wasm_set_exception(module, kind == WASM_FLOAT_TRAP_DIV_ZERO
+                                       ? "E_DIV_ZERO at ?"
+                                       : "E_NON_FINITE at ?");
+        return true;
+    }
+    ips[count++] = ip;
+    for (WASMInterpFrame *f = frame->prev_frame;
+         f && count < FLOAT_TRAP_DEPTH; f = f->prev_frame) {
+        if (f->ip) {
+            ips[count++] = f->ip - 1;
+        }
+    }
+    return handler(exec_env, (wasm_module_inst_t)module, kind,
+                   module->module->load_addr,
+                   (uint32)module->module->load_size, ips, count);
+}
+
+#define CHECK_F32_RESULT()                                                 \
+    do {                                                                   \
+        if (FLOAT_TRAP_F32_TRIPS()                                         \
+            && float_trap_raise(exec_env, module, frame, frame_ip_orig,    \
+                                WASM_FLOAT_TRAP_NON_FINITE))               \
+            goto got_exception;                                            \
+    } while (0)
+
+#define CHECK_F64_RESULT()                                                 \
+    do {                                                                   \
+        if (FLOAT_TRAP_F64_TRIPS()                                         \
+            && float_trap_raise(exec_env, module, frame, frame_ip_orig,    \
+                                WASM_FLOAT_TRAP_NON_FINITE))               \
+            goto got_exception;                                            \
+    } while (0)
+
+/* The operator leaves the popped divisor in the cells above the result. */
+#define CHECK_F32_QUOTIENT()                                               \
+    do {                                                                   \
+        if (FLOAT_TRAP_F32_TRIPS()                                         \
+            && float_trap_raise(exec_env, module, frame, frame_ip_orig,    \
+                                (frame_sp[0] << 1) == 0                    \
+                                    ? WASM_FLOAT_TRAP_DIV_ZERO             \
+                                    : WASM_FLOAT_TRAP_NON_FINITE))         \
+            goto got_exception;                                            \
+    } while (0)
+
+#define CHECK_F64_QUOTIENT()                                               \
+    do {                                                                   \
+        if (FLOAT_TRAP_F64_TRIPS()                                         \
+            && float_trap_raise(exec_env, module, frame, frame_ip_orig,    \
+                                frame_sp[0] == 0 && (frame_sp[1] << 1) == 0 \
+                                    ? WASM_FLOAT_TRAP_DIV_ZERO             \
+                                    : WASM_FLOAT_TRAP_NON_FINITE))         \
+            goto got_exception;                                            \
+    } while (0)
+#else
+#define CHECK_F32_RESULT() (void)0
+#define CHECK_F64_RESULT() (void)0
+#define CHECK_F32_QUOTIENT() (void)0
+#define CHECK_F64_QUOTIENT() (void)0
+#endif /* end of WASM_ENABLE_FLOAT_TRAP != 0 */
+
 #define DEF_OP_NUMERIC(src_type1, src_type2, src_op_type, operation)  \
     do {                                                              \
         frame_sp -= sizeof(src_type2) / sizeof(uint32);               \
@@ -1655,6 +1746,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
 #if WASM_ENABLE_DEBUG_INTERP != 0
     uint8 *frame_ip_orig = NULL;
+#if WASM_ENABLE_FLOAT_TRAP != 0
+    const WASMFuncType *native_type = NULL;
+#endif
     WASMDebugInstance *debug_instance = wasm_exec_env_get_instance(exec_env);
     bh_list *watch_point_list_read =
         debug_instance ? &debug_instance->watch_point_list_read : NULL;
@@ -4747,6 +4841,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 uint8 *p_float = (uint8 *)frame_sp++;
                 for (i = 0; i < sizeof(float32); i++)
                     *p_float++ = *frame_ip++;
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
@@ -4756,6 +4851,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_sp++;
                 for (i = 0; i < sizeof(float64); i++)
                     *p_float++ = *frame_ip++;
+                CHECK_F64_RESULT();
                 HANDLE_OP_END();
             }
 
@@ -5326,30 +5422,35 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_F32_SQRT)
             {
                 DEF_OP_MATH(float32, F32, sqrtf);
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_ADD)
             {
                 DEF_OP_NUMERIC(float32, float32, F32, +);
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SUB)
             {
                 DEF_OP_NUMERIC(float32, float32, F32, -);
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_MUL)
             {
                 DEF_OP_NUMERIC(float32, float32, F32, *);
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_DIV)
             {
                 DEF_OP_NUMERIC(float32, float32, F32, /);
+                CHECK_F32_QUOTIENT();
                 HANDLE_OP_END();
             }
 
@@ -5430,30 +5531,35 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_F64_SQRT)
             {
                 DEF_OP_MATH(float64, F64, sqrt);
+                CHECK_F64_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_ADD)
             {
                 DEF_OP_NUMERIC_64(float64, float64, F64, +);
+                CHECK_F64_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SUB)
             {
                 DEF_OP_NUMERIC_64(float64, float64, F64, -);
+                CHECK_F64_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_MUL)
             {
                 DEF_OP_NUMERIC_64(float64, float64, F64, *);
+                CHECK_F64_RESULT();
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_DIV)
             {
                 DEF_OP_NUMERIC_64(float64, float64, F64, /);
+                CHECK_F64_QUOTIENT();
                 HANDLE_OP_END();
             }
 
@@ -5600,6 +5706,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_F32_DEMOTE_F64)
             {
                 DEF_OP_CONVERT(float32, F32, float64, F64);
+                CHECK_F32_RESULT();
                 HANDLE_OP_END();
             }
 
@@ -6721,6 +6828,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             else
 #endif /* end of WASM_ENABLE_MULTI_MODULE != 0 */
             {
+#if WASM_ENABLE_FLOAT_TRAP != 0
+                native_type = cur_func->u.func_import->func_type;
+#endif
                 wasm_interp_call_func_native(module, exec_env, cur_func,
                                              prev_frame);
 #if WASM_ENABLE_TAIL_CALL != 0 || WASM_ENABLE_GC != 0
@@ -6748,6 +6858,18 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory);
 #endif
             if (wasm_copy_exception(module, NULL)) {
+#if WASM_ENABLE_FLOAT_TRAP != 0
+                /* A native that found a non-finite result it cannot place
+                   (it has no line) asks for the caller's. Only this path
+                   compares text. */
+                if (native_type
+                    && !strcmp(wasm_get_exception(module),
+                               "Exception: " WASM_FLOAT_TRAP_UNPLACED)) {
+                    wasm_set_exception(module, NULL);
+                    float_trap_raise(exec_env, module, frame, frame_ip_orig,
+                                     WASM_FLOAT_TRAP_NON_FINITE);
+                }
+#endif
 #if WASM_ENABLE_EXCE_HANDLING != 0
                 /* the caller raised an exception */
                 char uncaught_exception[128] = { 0 };
@@ -6778,6 +6900,19 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif /* WASM_ENABLE_EXCE_HANDLING != 0 */
                 goto got_exception;
             }
+#if WASM_ENABLE_FLOAT_TRAP != 0
+            if (native_type) {
+                const WASMFuncType *type = native_type;
+                native_type = NULL;
+                if (type->result_count == 1) {
+                    uint8 result = type->types[type->param_count];
+                    if (result == VALUE_TYPE_F32)
+                        CHECK_F32_RESULT();
+                    else if (result == VALUE_TYPE_F64)
+                        CHECK_F64_RESULT();
+                }
+            }
+#endif
         }
         else {
             WASMFunction *cur_wasm_func = cur_func->u.func;

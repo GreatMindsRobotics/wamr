@@ -3438,6 +3438,22 @@ wasm_copy_exception(WASMModuleInstance *module_inst, char *exception_buf)
     return has_exception;
 }
 
+#if WASM_ENABLE_FLOAT_TRAP != 0
+static wasm_float_trap_handler_t float_trap_handler;
+
+void
+wasm_runtime_set_float_trap_handler(wasm_float_trap_handler_t handler)
+{
+    float_trap_handler = handler;
+}
+
+wasm_float_trap_handler_t
+wasm_runtime_get_float_trap_handler(void)
+{
+    return float_trap_handler;
+}
+#endif
+
 void
 wasm_runtime_set_exception(WASMModuleInstanceCommon *module_inst_comm,
                            const char *exception)

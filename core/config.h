@@ -229,6 +229,10 @@
 #endif
 
 /* Source debugging */
+#ifndef WASM_ENABLE_FLOAT_TRAP
+#define WASM_ENABLE_FLOAT_TRAP 0
+#endif
+
 #ifndef WASM_ENABLE_DEBUG_INTERP
 #define WASM_ENABLE_DEBUG_INTERP 0
 #endif
